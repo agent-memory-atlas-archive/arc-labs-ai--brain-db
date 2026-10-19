@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/arc-labs-ai/brain-db/compare/v0.1.0...v0.2.0) (2026-10-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **byok:** a cache file written before the credential-scope key is refused at open, so `llm_cache.redb` must be deleted when upgrading. The shard fails to start rather than silently reusing rows whose payer is unknown. Nothing durable is lost — the cache is a derived accelerator in its own file and every row is recomputable by re-asking the model.
+
+### Features
+
+* **byok:** resolve LLM credentials per namespace, and make the index tunable ([320cf83](https://github.com/arc-labs-ai/brain-db/commit/320cf83bba08d7320476784cb955507cdb308ec3))
+
 ## 0.1.0 (2026-10-07)
 
 
