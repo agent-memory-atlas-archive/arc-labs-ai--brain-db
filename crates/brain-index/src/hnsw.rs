@@ -131,7 +131,20 @@ impl HnswIndex {
         loop {
             results.clear();
             let fetch_k = k.saturating_mul(fetch_multiplier).min(total_nodes);
-            let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+            // THE BEAM HAS TO COVER WHAT WE ASK FOR.
+            //
+            // `resolve_ef` floors `ef` on `k`, but the call below asks for
+            // `fetch_k` neighbours — `OVER_FACTOR * k`, doubling on each retry.
+            // At the shipped defaults that was `search(fetch_k = 128, ef = 64)`:
+            // requesting 128 neighbours from a 64-wide beam, which a graph walk
+            // cannot honestly answer. The over-fetch exists so tombstones and
+            // the caller's filter can be applied without under-returning, so
+            // the beam has to be sized to the fetch, not to the final `k`.
+            //
+            // Capped at `ef_search_max` (500), which is already the ceiling the
+            // escalation below respects and matches Weaviate's `efMax`.
+            let ef_eff = ef.max(fetch_k).min(self.params.ef_search_max);
+            let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef_eff);
 
             for n in neighbours {
                 if results.len() >= k {
@@ -160,7 +173,7 @@ impl HnswIndex {
                 break;
             }
             let fetch_saturated = fetch_k >= total_nodes;
-            let ef_saturated = ef >= self.params.ef_search_max;
+            let ef_saturated = ef_eff >= self.params.ef_search_max;
             if fetch_saturated && ef_saturated {
                 tracing::debug!(
                     requested_k = k,
@@ -259,8 +272,14 @@ impl HnswIndex {
     }
 
     /// Resolve the effective `ef_search` for a single query.
+    ///
+    /// An explicit per-query `ef` wins; otherwise the wider of the configured
+    /// `ef_search` and `k * ef_factor` is used. `ef_factor` defaults to 1, so
+    /// this reproduces the previous `max(ef_search, k)` exactly until an
+    /// operator raises it.
     fn resolve_ef(&self, k: usize, ef: Option<usize>) -> usize {
-        let requested = ef.unwrap_or(self.params.ef_search);
+        let derived = k.saturating_mul(self.params.ef_factor);
+        let requested = ef.unwrap_or_else(|| self.params.ef_search.max(derived));
         requested.max(k).min(self.params.ef_search_max)
     }
 
@@ -355,5 +374,98 @@ mod tests {
         // tombstone on an unknown id errors
         let err = idx.mark_tombstoned(mid(99)).expect_err("unknown id");
         assert!(matches!(err, HnswError::MemoryIdNotFound { .. }));
+    }
+
+    // ── ef derivation (accuracy plan §1) ──────────────────────────────────
+
+    /// The default MUST reproduce the prior behaviour exactly: `ef_factor = 1`
+    /// makes `resolve_ef` the old `max(ef_search, k)`. This is the guarantee
+    /// that shipping the knob changes nothing until an operator opts in.
+    #[test]
+    fn default_ef_factor_reproduces_prior_behaviour() {
+        let idx = HnswIndex::new(IndexParams::default()).unwrap();
+        let p = IndexParams::default();
+        assert_eq!(p.ef_factor, 1, "the shipped default must be a no-op");
+
+        // k below ef_search -> ef_search wins, as before.
+        assert_eq!(idx.resolve_ef(10, None), p.ef_search);
+        // k above ef_search -> floored on k, as before.
+        assert_eq!(idx.resolve_ef(200, None), 200);
+        // an explicit ef still wins, still clamped to [k, max].
+        assert_eq!(idx.resolve_ef(10, Some(300)), 300);
+        assert_eq!(idx.resolve_ef(10, Some(5)), 10, "clamped up to k");
+        assert_eq!(
+            idx.resolve_ef(10, Some(9_000)),
+            p.ef_search_max,
+            "clamped down to the ceiling"
+        );
+    }
+
+    /// With a factor set, `ef` scales with `k` and still respects the ceiling.
+    /// Weaviate's equivalent factor is 8 against the same 500 cap.
+    #[test]
+    fn ef_factor_scales_with_k_and_respects_the_ceiling() {
+        let params = IndexParams {
+            ef_factor: 8,
+            ..IndexParams::default()
+        };
+        params.validate().expect("factor 8 is in range");
+        let idx = HnswIndex::new(params).unwrap();
+
+        // 10 * 8 = 80, which beats ef_search (64).
+        assert_eq!(idx.resolve_ef(10, None), 80);
+        // 64 * 8 = 512 -> clamped to ef_search_max.
+        assert_eq!(idx.resolve_ef(64, None), params.ef_search_max);
+        // An explicit per-query ef still overrides the derivation.
+        assert_eq!(idx.resolve_ef(10, Some(100)), 100);
+    }
+
+    #[test]
+    fn ef_factor_is_validated() {
+        for bad in [0usize, 17] {
+            let p = IndexParams {
+                ef_factor: bad,
+                ..IndexParams::default()
+            };
+            assert!(
+                matches!(p.validate(), Err(IndexParamsError::EfFactorOutOfRange(n)) if n == bad),
+                "ef_factor={bad} should be rejected"
+            );
+        }
+    }
+
+    /// THE CORRECTNESS FIX. The search over-fetches (`OVER_FACTOR * k`) so
+    /// tombstones and the caller's filter can be applied without
+    /// under-returning — but the beam was only sized to `k`, so the index was
+    /// asked for more neighbours than it was given room to find. Searching
+    /// must still return every live match once the beam covers the fetch.
+    #[test]
+    fn search_returns_all_live_matches_when_over_fetching() {
+        let mut idx = HnswIndex::new(IndexParams::default()).unwrap();
+        for n in 1..=40u64 {
+            idx.insert(mid(n), &one_hot(n as usize)).unwrap();
+        }
+        // k = 20 -> fetch_k = 40 = every node, with a beam that now covers it.
+        let hits = idx.search_all(&one_hot(1), 20, None);
+        assert_eq!(hits.len(), 20, "a full beam returns a full result set");
+        // The exact match must rank first.
+        assert_eq!(hits[0].0, mid(1));
+    }
+
+    /// A filter that rejects most of the corpus is the case the over-fetch
+    /// exists for; it must still fill `k` rather than silently under-returning.
+    #[test]
+    fn search_fills_k_through_a_selective_filter() {
+        let mut idx = HnswIndex::new(IndexParams::default()).unwrap();
+        for n in 1..=60u64 {
+            idx.insert(mid(n), &one_hot(n as usize)).unwrap();
+        }
+        // Keep only even ids: half the corpus is filtered out.
+        let hits = idx.search(&one_hot(2), 10, None, |m| m.slot().is_multiple_of(2));
+        assert_eq!(hits.len(), 10, "escalation must fill k past the filter");
+        assert!(
+            hits.iter().all(|(m, _)| m.slot().is_multiple_of(2)),
+            "the filter must hold"
+        );
     }
 }

@@ -47,6 +47,7 @@ use brain_extractors::{
 };
 use brain_llm::client::{model_id_hash, LlmClient};
 use brain_llm::AnthropicClient;
+use brain_llm::{CredentialScope, FixedResolver};
 use brain_metadata::llm_cache::LLM_RESPONSES_TABLE;
 use brain_metadata::LlmCacheDb;
 use brain_protocol::schema::ExtractorTarget;
@@ -107,6 +108,7 @@ fn memory(text: &str) -> Memory {
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,
@@ -130,7 +132,13 @@ fn build_extractor(
         "brain:live_anthropic_test".into(),
         ExtractorTarget::EntityOrStatement,
         EXT_VERSION,
-        client,
+        // BYOK made the extractor resolve a credential per namespace instead
+        // of holding one client. `FixedResolver` is the single-client adapter
+        // for exactly this case: it serves the hand-built live client to every
+        // namespace under `CredentialScope::HOUSE`, which is the scope the
+        // cache-key assertion below expects.
+        Arc::new(FixedResolver::new(client)),
+        MODEL.to_string(),
         cache,
         PROMPT.into(),
         None,
@@ -259,13 +267,18 @@ async fn live_anthropic_cache_short_circuits_second_call() {
 
     // The cache row must now be present. Read the exact key the
     // extractor uses (memory hash + extractor id + version + model
-    // hash) and capture the `created_at` so we can verify it doesn't
-    // move on the second call.
+    // hash + credential scope) and capture the `created_at` so we can
+    // verify it doesn't move on the second call.
+    //
+    // The trailing scope is `HOUSE` here: this test wires a static
+    // credential, which is the deployment-wide key every namespace shares
+    // when BYOK is not in play.
     let key = (
         ext.cache_input_hash(&ctx(&reg), &mem),
         EXT_ID_RAW,
         EXT_VERSION,
         model_id_hash(MODEL),
+        CredentialScope::HOUSE.get(),
     );
     let first_created_at = {
         let db = cache.lock();

@@ -36,7 +36,23 @@ use crate::impl_redb_rkyv_value;
 /// - `u64`      — `model_id`: blake3-low-64 of the model identifier
 ///   string (e.g. `"anthropic/claude-haiku-4-5"`). Avoids embedding a
 ///   variable-length string in every cache key.
-pub type LlmCacheKey = ([u8; 32], u32, u32, u64);
+/// - `u64`      — `credential_scope`: which credential paid for this row
+///   (`brain_llm::CredentialScope`). See below.
+///
+/// ## Why the credential scope is part of the key
+///
+/// Under BYOK the caller's own provider key pays for the completion. Without
+/// a scope component, one tenant's paid response is served to every other
+/// tenant that hashes to the same input — their key paid, someone else's
+/// request was satisfied. The scope closes that: rows are only shared between
+/// callers billing to the same credential. A single-key deployment maps every
+/// namespace to `CredentialScope::HOUSE` (0), so its cache behaves exactly as
+/// it did before the component existed.
+///
+/// The scope is **last** on purpose. [`sweep_expired`] resolves a TTL hint back
+/// to its rows by range-scanning the `input_hash` prefix; appending keeps that
+/// scan correct, whereas inserting the scope earlier would break it.
+pub type LlmCacheKey = ([u8; 32], u32, u32, u64, u64);
 
 /// Sorted-by-expiry secondary index used by the cache sweeper.
 ///
@@ -50,6 +66,23 @@ pub type LlmTtlKey = (u64, [u8; 32]);
 // Tables.
 // ---------------------------------------------------------------------------
 
+/// Cache rows, keyed by [`LlmCacheKey`].
+///
+/// One table, one name, no version suffix and **no migration**. Adding the
+/// credential-scope component changed the key's serialized layout, and redb
+/// types a table by its key and value signatures, so a cache file written
+/// before BYOK cannot have this table opened over it: [`LlmCacheDb::open`]
+/// fails with a signature mismatch and the shard does not start.
+///
+/// That is the intended behaviour, not an oversight. Carrying a `_v2` name
+/// would leave the one upgrade that needed it in the schema forever and invite
+/// a `_v3`; silently adopting the old rows is not an option either, because
+/// their key cannot say which credential paid for them — the exact confusion
+/// the scope component exists to prevent.
+///
+/// The remedy is to delete `llm_cache.redb`. Nothing durable is lost: every
+/// row is recomputable by re-asking the model, and the cache lives in its own
+/// file precisely so it can be discarded without touching `metadata.redb`.
 pub const LLM_RESPONSES_TABLE: TableDefinition<'static, LlmCacheKey, LlmResponse> =
     TableDefinition::new("llm_responses");
 
@@ -164,10 +197,11 @@ impl LlmCacheDb {
             source,
         })?;
 
+        let wtxn = db.begin_write()?;
+
         // Touch both tables so they exist after open(). Idempotent:
         // redb skips the create if a table with the same name + sigs
         // is already present.
-        let wtxn = db.begin_write()?;
         {
             let _ = wtxn.open_table(LLM_RESPONSES_TABLE)?;
         }
@@ -252,19 +286,21 @@ pub fn sweep_expired(db: &mut LlmCacheDb, now_unix_secs: u64) -> Result<usize, L
         let mut ttl = wtxn.open_table(LLM_RESPONSE_TTL_TABLE)?;
         for (expiry, hash) in &expired_ttl_keys {
             // The main-table key is (hash, extractor_id, extractor_version,
-            // model_id). A single input hash may match multiple rows if
-            // the same input has been cached under different extractor /
-            // version / model triples. Range-scan the hash-prefix to find
-            // them, collect, then remove — never delete while a borrow on
-            // the table iterator is alive.
+            // model_id, credential_scope). A single input hash may match
+            // multiple rows if the same input has been cached under different
+            // extractor / version / model tuples, or — under BYOK — paid for by
+            // different credentials. Range-scan the hash-prefix to find them
+            // all, collect, then remove: expiry is a property of the row, not
+            // of who paid for it, so every scope's copy expires together.
+            // Never delete while a borrow on the table iterator is alive.
             //
             // Each candidate row carries its own authoritative expiry. A
             // row is deleted only when *its* expiry is `<= now`: re-caching
             // the same key with a later TTL overwrites the row (extending
             // its expiry) but leaves the earlier TTL hint behind, so this
             // stale hint must not evict a row that is now live again.
-            let lo_key = (*hash, 0u32, 0u32, 0u64);
-            let hi_key = (*hash, u32::MAX, u32::MAX, u64::MAX);
+            let lo_key = (*hash, 0u32, 0u32, 0u64, 0u64);
+            let hi_key = (*hash, u32::MAX, u32::MAX, u64::MAX, u64::MAX);
             let mut main_keys: Vec<LlmCacheKey> = Vec::new();
             match responses.range(lo_key..=hi_key) {
                 Ok(iter) => {
@@ -326,6 +362,39 @@ mod tests {
         dir.path().join("llm_cache.redb")
     }
 
+    /// No backward compatibility, asserted rather than assumed: a cache file
+    /// written before the credential-scope component is REJECTED, not adopted.
+    ///
+    /// Adopting it would be the real hazard — those rows cannot say which
+    /// credential paid for them, so serving them under BYOK is exactly the
+    /// cross-tenant reuse the scope exists to prevent. Failing to open is the
+    /// safe outcome; the remedy is to delete `llm_cache.redb`, which costs
+    /// nothing durable.
+    #[test]
+    fn a_pre_byok_cache_file_is_refused_not_silently_adopted() {
+        // The pre-BYOK shape: same table name, key without the scope.
+        const PRE_BYOK_TABLE: TableDefinition<'static, ([u8; 32], u32, u32, u64), LlmResponse> =
+            TableDefinition::new("llm_responses");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        {
+            let db = Database::create(&path).unwrap();
+            let wtxn = db.begin_write().unwrap();
+            {
+                let mut t = wtxn.open_table(PRE_BYOK_TABLE).unwrap();
+                t.insert(&([7u8; 32], 1u32, 1u32, 42u64), &sample_response())
+                    .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        assert!(
+            LlmCacheDb::open(&path).is_err(),
+            "a pre-BYOK cache must fail the signature check, not be reused"
+        );
+    }
+
     fn sample_response() -> LlmResponse {
         LlmResponse::new(
             vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -341,7 +410,7 @@ mod tests {
         for (i, b) in hash.iter_mut().enumerate() {
             *b = i as u8;
         }
-        (hash, 7, 1, 0x0123_4567_89AB_CDEF)
+        (hash, 7, 1, 0x0123_4567_89AB_CDEF, 0)
     }
 
     #[test]
@@ -486,9 +555,9 @@ mod tests {
         let hash_a = [0x11u8; 32];
         let hash_b = [0x22u8; 32];
         let hash_c = [0x33u8; 32];
-        put_with_ttl(&mut db, (hash_a, 1, 1, 0), 100, &resp);
-        put_with_ttl(&mut db, (hash_b, 1, 1, 0), 200, &resp);
-        put_with_ttl(&mut db, (hash_c, 1, 1, 0), 300, &resp);
+        put_with_ttl(&mut db, (hash_a, 1, 1, 0, 0), 100, &resp);
+        put_with_ttl(&mut db, (hash_b, 1, 1, 0, 0), 200, &resp);
+        put_with_ttl(&mut db, (hash_c, 1, 1, 0, 0), 300, &resp);
 
         // now = 150 — only hash_a (expiry=100) qualifies.
         let removed = sweep_expired(&mut db, 150).unwrap();
@@ -498,9 +567,18 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         let main = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-        assert!(main.get(&(hash_a, 1u32, 1u32, 0u64)).unwrap().is_none());
-        assert!(main.get(&(hash_b, 1u32, 1u32, 0u64)).unwrap().is_some());
-        assert!(main.get(&(hash_c, 1u32, 1u32, 0u64)).unwrap().is_some());
+        assert!(main
+            .get(&(hash_a, 1u32, 1u32, 0u64, 0u64))
+            .unwrap()
+            .is_none());
+        assert!(main
+            .get(&(hash_b, 1u32, 1u32, 0u64, 0u64))
+            .unwrap()
+            .is_some());
+        assert!(main
+            .get(&(hash_c, 1u32, 1u32, 0u64, 0u64))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -521,7 +599,7 @@ mod tests {
         for i in 0..5 {
             let mut h = [0u8; 32];
             h[0] = i as u8;
-            put_with_ttl(&mut db, (h, 1, 1, 0), 100 + i, &resp);
+            put_with_ttl(&mut db, (h, 1, 1, 0, 0), 100 + i, &resp);
         }
         assert_eq!(count_main(&db), 5);
         assert_eq!(count_ttl(&db), 5);
@@ -538,13 +616,16 @@ mod tests {
         let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
         let resp = sample_response();
         let hash = [0x99u8; 32];
-        put_with_ttl(&mut db, (hash, 7, 2, 0xABCD), 500, &resp);
+        put_with_ttl(&mut db, (hash, 7, 2, 0xABCD, 0), 500, &resp);
 
         // Pre-condition: row in both tables.
         {
             let rtxn = db.read_txn().unwrap();
             let main = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-            assert!(main.get(&(hash, 7u32, 2u32, 0xABCDu64)).unwrap().is_some());
+            assert!(main
+                .get(&(hash, 7u32, 2u32, 0xABCDu64, 0u64))
+                .unwrap()
+                .is_some());
             let ttl = rtxn.open_table(LLM_RESPONSE_TTL_TABLE).unwrap();
             assert!(ttl.get(&(500u64, hash)).unwrap().is_some());
         }
@@ -555,7 +636,10 @@ mod tests {
         // Post-condition: neither table has the row.
         let rtxn = db.read_txn().unwrap();
         let main = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-        assert!(main.get(&(hash, 7u32, 2u32, 0xABCDu64)).unwrap().is_none());
+        assert!(main
+            .get(&(hash, 7u32, 2u32, 0xABCDu64, 0u64))
+            .unwrap()
+            .is_none());
         let ttl = rtxn.open_table(LLM_RESPONSE_TTL_TABLE).unwrap();
         assert!(ttl.get(&(500u64, hash)).unwrap().is_none());
     }
@@ -577,9 +661,9 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         {
             let mut t = wtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-            t.insert(&(hash, 1u32, 1u32, 0u64), &resp).unwrap();
-            t.insert(&(hash, 1u32, 2u32, 0u64), &resp).unwrap();
-            t.insert(&(hash, 2u32, 1u32, 0u64), &resp).unwrap();
+            t.insert(&(hash, 1u32, 1u32, 0u64, 0u64), &resp).unwrap();
+            t.insert(&(hash, 1u32, 2u32, 0u64, 0u64), &resp).unwrap();
+            t.insert(&(hash, 2u32, 1u32, 0u64, 0u64), &resp).unwrap();
         }
         {
             let mut ttl = wtxn.open_table(LLM_RESPONSE_TTL_TABLE).unwrap();
@@ -604,7 +688,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
         let hash = [0x77u8; 32];
-        let key = (hash, 1u32, 1u32, 0u64);
+        let key = (hash, 1u32, 1u32, 0u64, 0u64);
 
         // First put: expiry at 100s, token_count 111.
         let mut resp1 = sample_response();
@@ -643,15 +727,110 @@ mod tests {
     }
 
     #[test]
+    fn two_credentials_do_not_share_a_cache_row() {
+        // The reason the scope exists. Identical input, extractor, version and
+        // model, billed to two different credentials: two rows, not one. If
+        // this ever collapses to a single row, one tenant's key is paying for
+        // another tenant's completion.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
+        let (h, ext_id, v, model, _) = sample_key();
+        let tenant_a = (h, ext_id, v, model, 0xAAAA_u64);
+        let tenant_b = (h, ext_id, v, model, 0xBBBB_u64);
+
+        let mut resp_a = sample_response();
+        resp_a.token_count = 11;
+        let mut resp_b = sample_response();
+        resp_b.token_count = 22;
+
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
+            t.insert(&tenant_a, &resp_a).unwrap();
+            t.insert(&tenant_b, &resp_b).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
+        assert_eq!(t.get(&tenant_a).unwrap().unwrap().value().token_count, 11);
+        assert_eq!(t.get(&tenant_b).unwrap().unwrap().value().token_count, 22);
+    }
+
+    #[test]
+    fn house_scope_rows_are_shared_as_before() {
+        // A single-key deployment maps every namespace to HOUSE (0), so two
+        // namespaces hitting the same input still share one row — pre-BYOK
+        // cache behaviour is unchanged for anyone not using BYOK.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
+        let (h, ext_id, v, model, _) = sample_key();
+        let house = (h, ext_id, v, model, 0u64);
+
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
+            t.insert(&house, &sample_response()).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
+        assert!(
+            t.get(&house).unwrap().is_some(),
+            "a second namespace on the house key reads the same row"
+        );
+    }
+
+    #[test]
+    fn sweeper_evicts_every_credential_scope_sharing_an_input_hash() {
+        // Expiry is a property of the row, not of who paid. The sweeper's
+        // prefix scan must reach every scope's copy — this is what the
+        // "scope goes last in the tuple" decision buys.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
+        let hash = [0x5Au8; 32];
+        let resp = LlmResponse::new(vec![0u8; 4], 0, 0, 1, 0);
+        let now = 1_000u64;
+
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
+            t.insert(&(hash, 1u32, 1u32, 0u64, 0u64), &resp).unwrap();
+            t.insert(&(hash, 1u32, 1u32, 0u64, 0xAAAAu64), &resp)
+                .unwrap();
+            t.insert(&(hash, 1u32, 1u32, 0u64, 0xBBBBu64), &resp)
+                .unwrap();
+        }
+        {
+            let mut ttl = wtxn.open_table(LLM_RESPONSE_TTL_TABLE).unwrap();
+            ttl.insert(&(now - 1, hash), &()).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        assert_eq!(count_main(&db), 3, "three scopes, three rows");
+        // `sweep_expired` returns the count of TTL HINTS retired, not rows —
+        // one hint covers every scope sharing the input hash — so assert on
+        // the main table, which is what must actually be emptied.
+        let retired_hints = sweep_expired(&mut db, now).unwrap();
+        assert_eq!(retired_hints, 1, "one hint covered all three rows");
+        assert_eq!(
+            count_main(&db),
+            0,
+            "every credential scope's row is evicted together"
+        );
+    }
+
+    #[test]
     fn cache_key_components_distinguish_rows() {
         // Two cache rows with the same input_hash but different
         // extractor_versions are distinct: cache-key collisions must
         // be a true equality on all four fields.
         let dir = tempfile::tempdir().unwrap();
         let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
-        let (h, ext_id, _v, model) = sample_key();
-        let key_v1 = (h, ext_id, 1u32, model);
-        let key_v2 = (h, ext_id, 2u32, model);
+        let (h, ext_id, _v, model, scope) = sample_key();
+        let key_v1 = (h, ext_id, 1u32, model, scope);
+        let key_v2 = (h, ext_id, 2u32, model, scope);
 
         let mut resp_v1 = sample_response();
         resp_v1.token_count = 100;

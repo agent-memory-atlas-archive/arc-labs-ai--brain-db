@@ -157,6 +157,28 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 mod linux_main {
+
+    /// Ferry `[llm.broker]` into the spawn path, but only in `broker` mode.
+    ///
+    /// Gated on the mode rather than on the section merely being present: a config
+    /// that still has an `[llm.broker]` block from an earlier experiment must not
+    /// silently start resolving credentials per namespace while `mode = "static"`
+    /// says a single key is in use. The mode is the declaration; the section is
+    /// just its parameters.
+    fn broker_spawn_cfg(cfg: &Config) -> Option<crate::shard::LlmBrokerSpawnConfig> {
+        use crate::config::LlmMode;
+        if cfg.llm.mode != LlmMode::Broker {
+            return None;
+        }
+        cfg.llm
+            .broker
+            .as_ref()
+            .map(|b| crate::shard::LlmBrokerSpawnConfig {
+                url: b.url.clone(),
+                service_key: b.service_key.clone(),
+                ttl_secs: b.ttl_secs,
+            })
+    }
     use std::collections::HashMap;
     use std::process::ExitCode;
     use std::sync::Arc;
@@ -263,6 +285,7 @@ mod linux_main {
                 // Preflight only checks the credential; the ceiling is
                 // irrelevant to it.
                 extractor_max_tokens: None,
+                broker: broker_spawn_cfg(&cfg),
             };
             match preflight_llm_auth(&llm_cfg) {
                 LlmPreflight::Ok => {
@@ -537,6 +560,10 @@ mod linux_main {
             let mut spawn_cfg =
                 ShardSpawnConfig::new(cfg.storage.data_dir.clone(), dispatcher.clone());
             spawn_cfg.summarizer = summarizer.clone();
+            // Ferry `[hnsw]` into the shard's index. Until this existed the
+            // section reached only a metrics label, so an operator who tuned
+            // `ef_search` got no change in behaviour.
+            spawn_cfg.index_params = cfg.hnsw.index_params();
             // Ferry the operator's `[llm]` provider key / model id so the
             // LLM extractor tier can resolve a client from config when no
             // env var is set.
@@ -544,6 +571,7 @@ mod linux_main {
                 api_key: cfg.llm.api_key.clone(),
                 model: cfg.llm.model.clone(),
                 extractor_max_tokens: Some(cfg.extractors.llm.max_tokens),
+                broker: broker_spawn_cfg(cfg),
             };
             // Ferry the operator's `[workers.auto_edge]`
             // overrides into the per-shard spawn config so the

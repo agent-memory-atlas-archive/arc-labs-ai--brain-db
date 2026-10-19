@@ -1,9 +1,15 @@
 //! Idempotency cache helpers for the LLM extractor tier.
 //!
 //! Wraps the substrate's [`LlmCacheDb`] with the `(input_hash,
-//! extractor_id, extractor_version, model_id_hash)` keying so two
-//! extractor versions can co-exist on the same memory and the
+//! extractor_id, extractor_version, model_id_hash, credential_scope)`
+//! keying so two extractor versions can co-exist on the same memory and the
 //! sweeper can drop entries by extractor when a schema is migrated.
+//!
+//! `credential_scope` is which credential paid for the row. Under BYOK a
+//! completion bought with one tenant's provider key must not be served to
+//! another tenant, so it is part of the key rather than a filter applied
+//! afterwards. A single-key deployment passes `CredentialScope::HOUSE` for
+//! every namespace and shares rows exactly as it did before.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,11 +24,18 @@ pub(super) fn cache_get(
     extractor_id: u32,
     extractor_version: u32,
     model_id_hash: u64,
+    credential_scope: u64,
 ) -> Option<CachedResponse> {
     let db = cache.lock();
     let rtxn = db.read_txn().ok()?;
     let t = rtxn.open_table(LLM_RESPONSES_TABLE).ok()?;
-    let key = (input_hash, extractor_id, extractor_version, model_id_hash);
+    let key = (
+        input_hash,
+        extractor_id,
+        extractor_version,
+        model_id_hash,
+        credential_scope,
+    );
     let row = t.get(&key).ok().flatten()?;
     Some(row.value())
 }
@@ -34,6 +47,7 @@ pub(super) fn cache_put(
     extractor_id: u32,
     extractor_version: u32,
     model_id_hash: u64,
+    credential_scope: u64,
     response_blob: Vec<u8>,
     token_count: u32,
     now_nanos: u64,
@@ -43,7 +57,13 @@ pub(super) fn cache_put(
     let wtxn = db
         .write_txn()
         .map_err(|e| format!("cache write_txn: {e}"))?;
-    let key = (input_hash, extractor_id, extractor_version, model_id_hash);
+    let key = (
+        input_hash,
+        extractor_id,
+        extractor_version,
+        model_id_hash,
+        credential_scope,
+    );
     let expires_at_nanos = now_nanos.saturating_add(ttl.as_nanos() as u64);
     let value = CachedResponse::new(
         response_blob,

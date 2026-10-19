@@ -463,6 +463,14 @@ pub struct ShardSpawnConfig {
     pub arena_initial_capacity_slots: u64,
     /// WAL configuration (group commit window, segment size limit, ...).
     pub wal_config: WalConfig,
+    /// HNSW geometry + search knobs for this shard's vector index.
+    ///
+    /// Ferried from `[hnsw]`. Before this field existed, `spawn_shard` built
+    /// `IndexParams::default_v1()` directly and the whole `[hnsw]` section
+    /// reached nothing but a metrics label — editing `ef_search` in config
+    /// changed no behaviour at all. The config defaults happen to equal
+    /// `default_v1()`, which is why the disconnect was invisible.
+    pub index_params: IndexParams,
     /// Consolidation worker's Summarizer. Defaults to
     /// [`DisabledSummarizer`] so existing tests + non-LLM deployments
     /// keep working. `main.rs::linux_main::run` injects an LLM-backed
@@ -530,6 +538,22 @@ pub struct LlmSpawnConfig {
     /// `[extractors.llm] max_tokens`. `None` leaves the LLM extractor on
     /// its own default.
     pub extractor_max_tokens: Option<u32>,
+    /// `[llm.broker]` — set when `[llm] mode = "broker"` (BYOK).
+    ///
+    /// When present the shard resolves a credential **per namespace** from the
+    /// edge instead of using one process-wide key, and `api_key` is unused.
+    pub broker: Option<LlmBrokerSpawnConfig>,
+}
+
+/// Where per-namespace credentials are resolved from, under BYOK.
+#[derive(Clone, Debug, Default)]
+pub struct LlmBrokerSpawnConfig {
+    /// Edge base URL, e.g. `http://brain-edge:8080`.
+    pub url: String,
+    /// Brain's own token to the broker. **Not** a provider key.
+    pub service_key: Option<String>,
+    /// How long a resolved namespace credential stays cached.
+    pub ttl_secs: u64,
 }
 
 /// Knobs ferried from `Config.rerank` into the spawn path.
@@ -856,6 +880,7 @@ impl ShardSpawnConfig {
             data_dir: data_dir.into(),
             arena_initial_capacity_slots: DEFAULT_INITIAL_CAPACITY_SLOTS,
             wal_config: WalConfig::default(),
+            index_params: IndexParams::default_v1(),
             summarizer: Arc::new(DisabledSummarizer),
             auto_edge: AutoEdgeSpawnConfig::default(),
             extractor: ExtractorSpawnConfig::default(),
@@ -2910,6 +2935,8 @@ pub fn spawn_shard(
     // shared across every shard so the BERT weights live in memory
     // exactly once no matter how many shards spawn.
     let dispatcher_for_closure = cfg.dispatcher.clone();
+    // `IndexParams` is `Copy`, so the move-closure gets its own copy.
+    let index_params_for_closure = cfg.index_params;
     let wal_dir_for_executor = wal_dir.clone();
     let arena_path_for_executor = arena_path.clone();
     let metadata_path_for_executor = metadata_path.clone();
@@ -2944,8 +2971,7 @@ pub fn spawn_shard(
         .spawn(move || async move {
             // Build per-shard HNSW; tombstones rebuilt by HnswMaintenanceWorker.
             let (hnsw_shared, hnsw_writer) =
-                SharedHnsw::new(IndexParams::default_v1())
-                    .expect("SharedHnsw::new");
+                SharedHnsw::new(index_params_for_closure).expect("SharedHnsw::new");
             let dispatcher: Arc<dyn Dispatcher> = dispatcher_for_closure;
             // Per-shard StatementHnswIndex. Populated by the
             // StatementEmbedWorker draining `STATEMENT_EMBED_QUEUE_TABLE`
@@ -3155,6 +3181,10 @@ pub fn spawn_shard(
                 );
             }
             let llm_cache_for_ops = llm_deps.cache.clone();
+            // Same resolver the extractor tier and HyPE use, handed to the ops
+            // layer so ENCODE can reject a namespace with no provider key at
+            // the door instead of acking a write it cannot ground.
+            let llm_resolver_for_ops = llm_deps.resolver.clone();
             // Snapshot the disambiguator before `llm_deps` is consumed
             // by `into_materialize_deps` below — the extractor worker
             // wires it directly into the resolver path so ambiguous-
@@ -3163,7 +3193,11 @@ pub fn spawn_shard(
             // Snapshot the primary LLM client + model for the HyPE
             // generator, before `llm_deps` is consumed below. `None` when
             // no provider key resolved — HyPE generation then stays off.
-            let hype_client_for_worker = llm_deps.primary_client.clone();
+            // HyPE resolves its credential per namespace, like the LLM
+            // extractor tier: it is mandatory and runs on every write, so it
+            // is the largest LLM cost on the write path and the one most
+            // visibly mis-billed if it used a single shard-wide client.
+            let hype_resolver_for_worker = llm_deps.resolver.clone();
             let hype_model_for_worker = llm_deps.primary_model.clone();
             // Dedicated cache handle for the HyPE generator: `llm_cache_for_ops`
             // is moved into OpsContext below, so snapshot the Arc now.
@@ -3527,6 +3561,7 @@ pub fn spawn_shard(
                 .with_extractor_registry(extractor_registry)
                 .with_classifier_config(classifier_config)
                 .with_llm_cache(llm_cache_for_ops)
+                .with_llm_credential_resolver(llm_resolver_for_ops)
                 .with_tantivy(Some(tantivy_for_ops))
                 .with_entity_vector_index(std::sync::Arc::new(
                     self::adapters::ShardEntityVectorIndex::new(entity_hnsw_for_shard.clone()),
@@ -4290,11 +4325,11 @@ pub fn spawn_shard(
                 // directly without a provider key/cache — in which case the
                 // shard already logged a WARN above; HyPE is then inoperative
                 // and we skip wiring it rather than panic the executor thread.
-                match (hype_client_for_worker.clone(), hype_cache_for_worker.clone()) {
-                    (Some(client), Some(cache)) => {
+                match (hype_resolver_for_worker.clone(), hype_cache_for_worker.clone()) {
+                    (Some(resolver), Some(cache)) => {
                         let num_questions = extractor_tuning_spawn_cfg.hype_num_questions.max(1);
                         let generator = brain_workers::HypeGenerator::new(
-                            client,
+                            resolver,
                             hype_model_for_worker.clone(),
                             dispatcher.clone(),
                             hype_hnsw_for_shard.clone(),

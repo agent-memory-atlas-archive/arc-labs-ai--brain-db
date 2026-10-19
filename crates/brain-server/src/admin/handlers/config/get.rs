@@ -26,7 +26,27 @@ use crate::admin::AdminState;
 
 /// Object keys whose values are secrets and must never be serialized to a
 /// client. Matched case-insensitively, at any depth.
+///
+/// Any key ending in `_key` is also treated as a secret — see
+/// [`is_secret_key`]. An exact-match list alone had already missed one:
+/// `llm.broker.service_key` was added to the config and served in plaintext,
+/// because it is not spelled `api_key`.
 const SECRET_KEYS: &[&str] = &["api_key", "token", "secret", "password"];
+
+/// Suffix that marks a key-material field whatever it is prefixed with, so a
+/// newly added `*_key` secret is redacted by default rather than on the day
+/// someone remembers to extend [`SECRET_KEYS`].
+///
+/// Deliberately a SUFFIX with the underscore, not a substring: `tls.key` is a
+/// path to a key file on disk, not key material, and operators need to read it
+/// to diagnose a bad path. `key` alone therefore does not match.
+const SECRET_KEY_SUFFIX: &str = "_key";
+
+/// Whether an object key names a secret.
+fn is_secret_key(k: &str) -> bool {
+    let lower = k.to_ascii_lowercase();
+    SECRET_KEYS.iter().any(|s| lower == *s) || lower.ends_with(SECRET_KEY_SUFFIX)
+}
 
 /// Marker substituted for a set secret. A distinct sentinel (not `null`)
 /// so operators can tell "configured" from "unset".
@@ -39,7 +59,7 @@ fn redact_secrets(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
-                if SECRET_KEYS.iter().any(|s| k.eq_ignore_ascii_case(s)) {
+                if is_secret_key(k) {
                     if !v.is_null() {
                         *v = Value::String(REDACTED.to_string());
                     }
@@ -115,6 +135,39 @@ mod tests {
         // Non-secret fields are untouched.
         assert_eq!(v["llm"]["model"], "gpt-4o-mini");
         assert_eq!(v["server"]["listen_addr"], "0.0.0.0:8080");
+    }
+
+    /// `llm.broker.service_key` authenticates Brain to the credential broker.
+    /// It is not spelled `api_key`, so the exact-match list served it in
+    /// plaintext to any admin-token holder — defeating this module's whole
+    /// premise, which is that a token holder can confirm a secret is SET
+    /// without reading it.
+    #[test]
+    fn redacts_a_secret_whose_name_merely_ends_in_key() {
+        let mut v = json!({
+            "llm": {
+                "api_key": "sk-live-abc",
+                "broker": { "url": "http://edge:8080", "service_key": "svc-live-xyz" }
+            }
+        });
+        redact_secrets(&mut v);
+        assert_eq!(v["llm"]["api_key"], REDACTED);
+        assert_eq!(
+            v["llm"]["broker"]["service_key"], REDACTED,
+            "a `*_key` secret must be redacted without being listed by name"
+        );
+        // Non-secret siblings stay readable.
+        assert_eq!(v["llm"]["broker"]["url"], "http://edge:8080");
+    }
+
+    /// `tls.key` is a PATH to a key file, not key material. Operators read it
+    /// to diagnose a wrong path, so the suffix rule must not swallow it.
+    #[test]
+    fn leaves_a_bare_key_path_readable() {
+        let mut v = json!({ "tls": { "cert": "/etc/c.pem", "key": "/etc/k.pem" } });
+        redact_secrets(&mut v);
+        assert_eq!(v["tls"]["key"], "/etc/k.pem");
+        assert_eq!(v["tls"]["cert"], "/etc/c.pem");
     }
 
     #[test]

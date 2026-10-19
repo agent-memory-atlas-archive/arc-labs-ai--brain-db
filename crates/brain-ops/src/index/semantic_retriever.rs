@@ -188,7 +188,12 @@ impl BrainSemanticRetriever {
             )
         };
 
-        let ef = occupancy_scaled_ef(config.ef_search, config.top_k, self.memory_index.len());
+        let ef = resolve_probe_ef(
+            config.ef_search,
+            config.top_k,
+            self.memory_index.len(),
+            self.memory_index.params().ef_factor,
+        );
         let hits = self
             .memory_index
             .search(vector, config.top_k, Some(ef), id_passes);
@@ -811,19 +816,42 @@ fn ef_occupancy_enabled() -> bool {
     brain_core::RetrievalTuning::active().ef_occupancy_scaling
 }
 
-/// Scale `ef_search` to the index occupancy for size-invariant recall.
-/// Default-off returns the configured ef unchanged. When on: ef rises toward
-/// the live occupancy (so a small index is searched exhaustively — exact
-/// recall at tiny N, no phantom neighbours), is never below `top_k` (the
-/// ef ≥ k invariant) nor below the planner's configured ef, and is capped at
-/// `SEMANTIC_EF_SEARCH_MAX` so a huge index pays a bounded search cost.
-fn occupancy_scaled_ef(configured_ef: usize, top_k: usize, occupancy: usize) -> usize {
+/// Resolve the per-query `ef` for the memory probe.
+///
+/// Two inputs, answering different questions:
+///
+/// - `ef_factor` — *how many results are being asked for.* The floor is
+///   `max(configured_ef, top_k * ef_factor)`. HNSW recall depends on the beam
+///   being wider than the result set, and at the shipped defaults
+///   `configured_ef` and `top_k` are both 64, so without this the beam equals
+///   `k` exactly. Comes from the operator's `[hnsw] ef_factor`, read off the
+///   index rather than re-declared here.
+/// - occupancy scaling — *how large the haystack is.* Off by default
+///   (`RetrievalTuning::ef_occupancy_scaling`). When on, ef rises toward live
+///   occupancy so a small index is searched exhaustively (exact recall at tiny
+///   N, no phantom neighbours), never below `top_k`, and capped at
+///   `SEMANTIC_EF_SEARCH_MAX` so a huge index pays a bounded cost.
+///
+/// This function owns the whole decision on purpose. `HnswIndex::resolve_ef`
+/// applies `ef_factor` only when `ef` is `None`, and this caller always passes
+/// `Some(..)` — so until `ef_factor` was threaded through here it could be
+/// configured, documented and validated while changing nothing at all.
+///
+/// `ef_factor` defaults to 1, making the floor `max(configured_ef, top_k)`,
+/// which is the previous behaviour exactly in both branches.
+fn resolve_probe_ef(
+    configured_ef: usize,
+    top_k: usize,
+    occupancy: usize,
+    ef_factor: usize,
+) -> usize {
+    let floor = configured_ef.max(top_k.saturating_mul(ef_factor));
     if !ef_occupancy_enabled() {
-        return configured_ef;
+        return floor.min(SEMANTIC_EF_SEARCH_MAX);
     }
     occupancy
         .min(SEMANTIC_EF_SEARCH_MAX)
-        .max(configured_ef)
+        .max(floor)
         .max(top_k)
         .min(SEMANTIC_EF_SEARCH_MAX)
 }

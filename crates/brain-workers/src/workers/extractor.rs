@@ -877,6 +877,46 @@ struct RowFacts {
 
 /// Read each live memory's [`RowFacts`] in a single read txn. Ids whose
 /// row is absent (forgotten before extraction ran) are omitted.
+/// Resolve each memory's owning namespace NAME, de-duplicating the lookup per
+/// namespace id against one read transaction.
+///
+/// Shared by the extraction pass and the HyPE pass. Both bill their LLM calls
+/// to the owning tenant's credential under BYOK, so if they disagreed about a
+/// memory's namespace they would bill two different tenants for one write.
+/// An unresolved id falls back to the system namespace — never a silent drop.
+fn resolve_namespace_names(
+    ctx: &WorkerContext,
+    memory_ids: impl Iterator<Item = MemoryId>,
+    row_facts: &HashMap<MemoryId, RowFacts>,
+) -> Vec<String> {
+    let rtxn = ctx.ops.executor.metadata.read_txn().ok();
+    let mut cache: HashMap<u32, String> = HashMap::new();
+    memory_ids
+        .map(|mid| {
+            let ns_id = row_facts
+                .get(&mid)
+                .map(|f| f.namespace_id)
+                .unwrap_or_else(|| brain_core::NamespaceId::SYSTEM.raw());
+            if let Some(name) = cache.get(&ns_id) {
+                return name.clone();
+            }
+            let name = rtxn
+                .as_ref()
+                .and_then(|r| {
+                    brain_metadata::namespace::namespace_name(
+                        r,
+                        brain_core::NamespaceId::from(ns_id),
+                    )
+                    .ok()
+                    .flatten()
+                })
+                .unwrap_or_else(|| SYSTEM_NAMESPACE.to_string());
+            cache.insert(ns_id, name.clone());
+            name
+        })
+        .collect()
+}
+
 fn load_row_facts(
     ctx: &WorkerContext,
     live: &[(usize, MemoryId, Arc<str>)],
@@ -1030,34 +1070,8 @@ async fn drain_batch(
     // Distinct ids resolve once against one read txn; an unresolved id (or
     // a row miss) falls back to the system namespace so the system default
     // runs — never a silent drop, never a cross-tenant over-run.
-    let mem_namespaces: Vec<String> = {
-        let rtxn = ctx.ops.executor.metadata.read_txn().ok();
-        let mut cache: HashMap<u32, String> = HashMap::new();
-        live.iter()
-            .map(|(_, mid, _)| {
-                let ns_id = row_facts
-                    .get(mid)
-                    .map(|f| f.namespace_id)
-                    .unwrap_or_else(|| brain_core::NamespaceId::SYSTEM.raw());
-                if let Some(name) = cache.get(&ns_id) {
-                    return name.clone();
-                }
-                let name = rtxn
-                    .as_ref()
-                    .and_then(|r| {
-                        brain_metadata::namespace::namespace_name(
-                            r,
-                            brain_core::NamespaceId::from(ns_id),
-                        )
-                        .ok()
-                        .flatten()
-                    })
-                    .unwrap_or_else(|| SYSTEM_NAMESPACE.to_string());
-                cache.insert(ns_id, name.clone());
-                name
-            })
-            .collect()
-    };
+    let mem_namespaces: Vec<String> =
+        resolve_namespace_names(ctx, live.iter().map(|(_, mid, _)| *mid), &row_facts);
 
     // Fetch bounded LLM context (top-m similar memories + optional
     // rolling summary) per memory before running tiers. The fetch
@@ -1255,6 +1269,20 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
         return;
     };
     let cycle_budget = worker.knobs.llm_budget_per_cycle_micro_usd;
+
+    // Owning namespace per memory, resolved once for the whole pass. HyPE is
+    // mandatory and runs on every write, so under BYOK it is the largest LLM
+    // cost on the write path — it must be billed to the memory's own tenant,
+    // not to whichever credential the shard happens to hold.
+    let hype_live: Vec<(usize, MemoryId, Arc<str>)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (mid, text))| (i, *mid, Arc::clone(text)))
+        .collect();
+    let hype_row_facts = load_row_facts(ctx, &hype_live);
+    let hype_namespaces =
+        resolve_namespace_names(ctx, items.iter().map(|(mid, _)| *mid), &hype_row_facts);
+
     // Per-memory HyPE generation is independent: fan the LLM
     // calls out concurrently so a whole micro-batch costs ~one round-trip
     // instead of N serial ones. Every future runs on this single glommio task
@@ -1263,60 +1291,65 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
     // preserved). The per-cycle LLM budget is a soft cap here: a concurrent
     // fan-out can overshoot by at most the in-flight set (bounded by the
     // micro-batch size), which is the intended trade for the latency win.
-    let futs = items.iter().map(|(memory_id, text)| async move {
-        if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
-            return;
-        }
-        // Skip memories that already own question vectors — HyPE generates
-        // once per memory, idempotent across re-ingest, and a second insert
-        // would duplicate vectors in the live HNSW index.
-        let already = match ctx.ops.executor.metadata.as_ref().read_txn() {
-            Ok(rtxn) => hype_has_vectors(&rtxn, *memory_id).unwrap_or(false),
-            Err(_) => false,
-        };
-        if already {
-            return;
-        }
-        // Render the typed-graph facts already known about the entities this
-        // memory mentions, so HyPE can write multi-hop bridge questions that
-        // span more than this one memory (read-side multi-hop then resolves to
-        // a single cheap ANN probe — no read LLM). Empty for the first memory
-        // about a subject; fills in as the graph grows (and on re-ingest).
-        let scope = memory_scope_and_session(ctx, *memory_id).0;
-        let neighborhood = build_neighborhood(ctx, scope, text.as_ref());
-        let outcome = hype
-            .generate_for(*memory_id, text.as_ref(), &neighborhood)
-            .await;
-        // Stage journal (S4 HyPE). Success was previously metrics-only;
-        // this makes the per-memory question count observable so the eval
-        // probe can tell an empty HyPE pass (0 questions) apart from a
-        // skipped one.
-        tracing::debug!(
-            target: "brain_debug::stage",
-            stage = "S4_hype",
-            memory_id = memory_id.raw(),
-            questions_written = outcome.questions_written,
-            cost_micro_usd = outcome.cost_micro_usd,
-            "write stage: HyPE hypothetical questions generated",
-        );
-        if outcome.cost_micro_usd > 0 {
-            let mut spend = worker.llm_spend.lock();
-            *spend = spend.saturating_add(outcome.cost_micro_usd);
-            worker.metrics.add_llm_micro_usd(outcome.cost_micro_usd);
-        }
-        if outcome.questions_written > 0 {
-            // Fold into items_written so the eval drain barrier waits for
-            // HyPE, not just entity/statement extraction.
-            worker
-                .metrics
-                .add_items_written(ExtractorItemKind::HyPe, outcome.questions_written as u64);
-        }
-        // Publish a `StageCompleted{Hype}` event so a `--wait`/SUBSCRIBE
-        // caller watching this memory's derivation can tick HyPE off its
-        // pending-stage checklist — mirrors `publish_extracted_graph`'s
-        // per-memory publish below.
-        publish_hype_completed(ctx, *memory_id, scope.space(), outcome).await;
-    });
+    let futs =
+        items
+            .iter()
+            .zip(hype_namespaces.iter())
+            .map(|((memory_id, text), namespace)| async move {
+                if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
+                    return;
+                }
+                // Skip memories that already own question vectors — HyPE generates
+                // once per memory, idempotent across re-ingest, and a second insert
+                // would duplicate vectors in the live HNSW index.
+                let already = match ctx.ops.executor.metadata.as_ref().read_txn() {
+                    Ok(rtxn) => hype_has_vectors(&rtxn, *memory_id).unwrap_or(false),
+                    Err(_) => false,
+                };
+                if already {
+                    return;
+                }
+                // Render the typed-graph facts already known about the entities this
+                // memory mentions, so HyPE can write multi-hop bridge questions that
+                // span more than this one memory (read-side multi-hop then resolves to
+                // a single cheap ANN probe — no read LLM). Empty for the first memory
+                // about a subject; fills in as the graph grows (and on re-ingest).
+                let scope = memory_scope_and_session(ctx, *memory_id).0;
+                let neighborhood = build_neighborhood(ctx, scope, text.as_ref());
+                let outcome = hype
+                    .generate_for(namespace, *memory_id, text.as_ref(), &neighborhood)
+                    .await;
+                // Stage journal (S4 HyPE). Success was previously metrics-only;
+                // this makes the per-memory question count observable so the eval
+                // probe can tell an empty HyPE pass (0 questions) apart from a
+                // skipped one.
+                tracing::debug!(
+                    target: "brain_debug::stage",
+                    stage = "S4_hype",
+                    memory_id = memory_id.raw(),
+                    questions_written = outcome.questions_written,
+                    cost_micro_usd = outcome.cost_micro_usd,
+                    "write stage: HyPE hypothetical questions generated",
+                );
+                if outcome.cost_micro_usd > 0 {
+                    let mut spend = worker.llm_spend.lock();
+                    *spend = spend.saturating_add(outcome.cost_micro_usd);
+                    worker.metrics.add_llm_micro_usd(outcome.cost_micro_usd);
+                }
+                if outcome.questions_written > 0 {
+                    // Fold into items_written so the eval drain barrier waits for
+                    // HyPE, not just entity/statement extraction.
+                    worker.metrics.add_items_written(
+                        ExtractorItemKind::HyPe,
+                        outcome.questions_written as u64,
+                    );
+                }
+                // Publish a `StageCompleted{Hype}` event so a `--wait`/SUBSCRIBE
+                // caller watching this memory's derivation can tick HyPE off its
+                // pending-stage checklist — mirrors `publish_extracted_graph`'s
+                // per-memory publish below.
+                publish_hype_completed(ctx, *memory_id, scope.space(), outcome).await;
+            });
     futures_util::future::join_all(futs).await;
 }
 
@@ -1421,8 +1454,19 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
         return;
     }
 
+    // Same billing rule as the generate pass: a refresh re-calls the LLM, so
+    // it is paid for by the memory's own tenant.
+    let refresh_live: Vec<(usize, MemoryId, Arc<str>)> = batch
+        .iter()
+        .enumerate()
+        .map(|(i, (mid, text))| (i, *mid, Arc::<str>::from(text.as_str())))
+        .collect();
+    let refresh_row_facts = load_row_facts(ctx, &refresh_live);
+    let refresh_namespaces =
+        resolve_namespace_names(ctx, batch.iter().map(|(mid, _)| *mid), &refresh_row_facts);
+
     let mut last_examined = start;
-    for (memory_id, text) in &batch {
+    for ((memory_id, text), namespace) in batch.iter().zip(refresh_namespaces.iter()) {
         if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
             break;
         }
@@ -1436,7 +1480,7 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
             continue;
         }
         let outcome = hype
-            .refresh_for(*memory_id, text.as_str(), &neighborhood)
+            .refresh_for(namespace, *memory_id, text.as_str(), &neighborhood)
             .await;
         if outcome.cost_micro_usd > 0 {
             let mut spend = worker.llm_spend.lock();
@@ -2095,6 +2139,23 @@ async fn run_pipeline_batch(
     let empty_reg = ExtractorRegistry::new();
     let now = now_unix_nanos();
 
+    // Owning namespace per memory id, for the LLM tier's BYOK credential
+    // lookup. Built per memory rather than once per batch because
+    // `run_llm_tier_into` already routes per memory: the system-default
+    // extractor is effective for every namespace that has not declared its
+    // own, so one sub-batch can carry memories from several tenants. A single
+    // batch-level namespace would bill them all to whichever tenant came
+    // first.
+    //
+    // `mem_namespaces` is positional against `mems`; zip rather than index so
+    // a short slice simply yields fewer entries (absent ids fall back to the
+    // system namespace) instead of silently misattributing a memory.
+    let memory_namespaces: HashMap<MemoryId, String> = mems
+        .iter()
+        .zip(mem_namespaces.iter())
+        .map(|(m, ns)| (m.id, ns.clone()))
+        .collect();
+
     let mut outcomes: Vec<PipelineOutcome> = (0..mems.len())
         .map(|_| PipelineOutcome {
             items: Vec::new(),
@@ -2132,6 +2193,7 @@ async fn run_pipeline_batch(
     // ----- Tier 1: pattern -------------------------------------------
     {
         let ctx = ExtractionContext {
+            memory_namespaces: Some(&memory_namespaces),
             schema_version: 1,
             now_unix_nanos: now,
             registry: &empty_reg,
@@ -2156,6 +2218,7 @@ async fn run_pipeline_batch(
     // ----- Tier 2: classifier ----------------------------------------
     {
         let ctx = ExtractionContext {
+            memory_namespaces: Some(&memory_namespaces),
             schema_version: 1,
             now_unix_nanos: now,
             registry: &empty_reg,
@@ -2210,6 +2273,7 @@ async fn run_pipeline_batch(
         // just without the neighbor section.
         let extractor_context_map = extractor_context_map.as_ref();
         let ctx = ExtractionContext {
+            memory_namespaces: Some(&memory_namespaces),
             schema_version: 1,
             now_unix_nanos: now,
             registry: &empty_reg,
@@ -7282,6 +7346,7 @@ mod tests {
 
         let empty_reg = ExtractorRegistry::new();
         let ctx = ExtractionContext {
+            memory_namespaces: None,
             schema_version: 1,
             now_unix_nanos: 0,
             registry: &empty_reg,
@@ -8205,6 +8270,7 @@ mod tests {
             occurred_at_unix_nanos: None,
         };
         let ectx = ExtractionContext {
+            memory_namespaces: None,
             schema_version: 1,
             now_unix_nanos: INGEST,
             registry: &registry,
@@ -8416,6 +8482,7 @@ mod tests {
             occurred_at_unix_nanos: None,
         };
         let ectx = ExtractionContext {
+            memory_namespaces: None,
             schema_version: 1,
             now_unix_nanos: INGEST,
             registry: &registry,

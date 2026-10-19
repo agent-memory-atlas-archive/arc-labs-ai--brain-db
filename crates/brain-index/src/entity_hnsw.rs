@@ -258,7 +258,13 @@ impl EntityHnswIndex {
         loop {
             out.clear();
             let fetch_k = k.saturating_mul(fetch_multiplier).min(total_nodes);
-            let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+            // The beam has to cover what we ask for: `fetch_k` is
+            // `OVER_FACTOR * k` and doubles on each retry, so sizing `ef` to
+            // `k` alone asks the graph for more neighbours than it was given
+            // room to find. `hype_hnsw` already floors on `fetch_k`; this is
+            // the same fix. Capped at the ceiling the escalation respects.
+            let ef_eff = ef.max(fetch_k).min(self.params.ef_search_max);
+            let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef_eff);
             for n in neighbours {
                 if out.len() >= k {
                     break;
@@ -283,7 +289,7 @@ impl EntityHnswIndex {
                 break;
             }
             let fetch_saturated = fetch_k >= total_nodes;
-            let ef_saturated = ef >= self.params.ef_search_max;
+            let ef_saturated = ef_eff >= self.params.ef_search_max;
             if fetch_saturated && ef_saturated {
                 tracing::debug!(
                     requested_k = k,

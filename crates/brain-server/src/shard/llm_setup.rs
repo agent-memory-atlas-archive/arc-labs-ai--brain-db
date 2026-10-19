@@ -33,7 +33,10 @@ use std::sync::{Arc, OnceLock};
 
 use brain_extractors::{ClassifierModel, EntityDisambiguator, MaterializeDeps};
 use brain_llm::client::LlmFuture;
-use brain_llm::{AnthropicClient, LlmClient, LlmError, LlmRequest, ModelRouter, OpenAIClient};
+use brain_llm::{
+    AnthropicClient, BrokerResolver, LlmClient, LlmCredentialResolver, LlmError, LlmRequest,
+    ModelRouter, OpenAIClient, StaticResolver,
+};
 use brain_metadata::LlmCacheDb;
 use parking_lot::Mutex;
 
@@ -149,6 +152,15 @@ fn bridge(client: Arc<dyn LlmClient>) -> Arc<dyn LlmClient> {
 /// ambiguous-band partial matches.
 pub struct LlmDeps {
     pub router: Option<Arc<ModelRouter>>,
+    /// Per-namespace credential resolution — the BYOK seam.
+    ///
+    /// In `static` mode this is a [`StaticResolver`] over [`Self::router`],
+    /// which reproduces pre-BYOK behaviour exactly: one credential, every
+    /// namespace. A broker-backed resolver takes its place when the
+    /// deployment resolves credentials per tenant.
+    ///
+    /// `None` only when no provider key was resolvable at all.
+    pub resolver: Option<Arc<dyn LlmCredentialResolver>>,
     pub cache: Option<Arc<Mutex<LlmCacheDb>>>,
     /// Optional partial-match disambiguator. Populated when at least
     /// one provider client is available; the disambiguator shares
@@ -185,7 +197,7 @@ impl LlmDeps {
         MaterializeDeps {
             classifier_model,
             entity_type_qnames,
-            model_router: self.router,
+            credential_resolver: self.resolver,
             llm_cache: self.cache,
             llm_max_tokens: self.max_tokens,
         }
@@ -207,14 +219,73 @@ pub fn build_llm_deps(shard_dir: &Path, llm_cfg: &LlmSpawnConfig) -> LlmDeps {
     let disambiguator = primary_client
         .clone()
         .map(|c| Arc::new(EntityDisambiguator::new(c, primary_model.clone())));
+    let router = build_router(llm_cfg);
+    // BYOK (`mode = "broker"`) wins when configured: credentials are resolved
+    // per namespace from the edge, and `[llm] api_key` is not consulted at all.
+    // Otherwise `static` mode gives one credential to every namespace, exactly
+    // as this shard behaved before BYOK existed.
+    let resolver: Option<Arc<dyn LlmCredentialResolver>> =
+        if let Some(broker) = llm_cfg.broker.as_ref() {
+            build_broker_resolver(broker)
+        } else {
+            router
+                .clone()
+                .map(|r| Arc::new(StaticResolver::new(r, primary_model.clone())) as Arc<_>)
+        };
     LlmDeps {
-        router: build_router(llm_cfg),
+        router,
+        resolver,
         cache: open_cache(shard_dir),
         disambiguator,
         primary_client,
         primary_model,
         max_tokens: llm_cfg.extractor_max_tokens,
     }
+}
+
+/// Build the BYOK resolver from `[llm.broker]`.
+///
+/// Returns `None` — which degrades the LLM tier rather than panicking — when
+/// the broker is declared but unusable. A shard that cannot resolve any
+/// credential should surface that per write, with a reason, instead of
+/// refusing to start: the tenant-facing failure is already modelled
+/// (`llm_credential.missing`), and a boot loop tells an operator far less.
+fn build_broker_resolver(
+    broker: &super::LlmBrokerSpawnConfig,
+) -> Option<Arc<dyn LlmCredentialResolver>> {
+    let url = broker.url.trim();
+    if url.is_empty() {
+        tracing::error!(
+            target: "brain_server::llm_setup",
+            "[llm.broker] url is empty; the LLM tier will be degraded",
+        );
+        return None;
+    }
+    let Some(token) = broker
+        .service_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        tracing::error!(
+            target: "brain_server::llm_setup",
+            url,
+            "[llm.broker] service_key is unset; the LLM tier will be degraded",
+        );
+        return None;
+    };
+
+    let mut resolver = BrokerResolver::new(url, token);
+    if broker.ttl_secs > 0 {
+        resolver = resolver.with_ttl(std::time::Duration::from_secs(broker.ttl_secs));
+    }
+    tracing::info!(
+        target: "brain_server::llm_setup",
+        url,
+        ttl_secs = broker.ttl_secs,
+        "BYOK: resolving LLM credentials per namespace from the edge",
+    );
+    Some(Arc::new(resolver) as Arc<dyn LlmCredentialResolver>)
 }
 
 /// Resolve the configured model id: `[llm] model` > [`DEFAULT_MODEL`].
@@ -480,6 +551,7 @@ mod tests {
         let deps = LlmDeps {
             max_tokens: None,
             router: None,
+            resolver: None,
             cache: open_cache(dir.path()),
             disambiguator: None,
             primary_client: None,
@@ -487,7 +559,7 @@ mod tests {
         };
         let labels = Arc::new(vec!["brain:Person".to_string()]);
         let materialize = deps.into_materialize_deps(None, labels.clone());
-        assert!(materialize.model_router.is_none());
+        assert!(materialize.credential_resolver.is_none());
         assert!(materialize.llm_cache.is_some());
         assert!(materialize.classifier_model.is_none());
         assert_eq!(materialize.entity_type_qnames.as_slice(), labels.as_slice());
@@ -543,6 +615,7 @@ mod tests {
         let deps_a = LlmDeps {
             max_tokens: None,
             router: None,
+            resolver: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
             primary_client: None,
@@ -552,6 +625,7 @@ mod tests {
         let deps_b = LlmDeps {
             max_tokens: None,
             router: None,
+            resolver: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
             primary_client: None,

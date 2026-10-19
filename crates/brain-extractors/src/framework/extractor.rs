@@ -184,6 +184,22 @@ pub struct ExtractionContext<'a> {
     pub schema_version: u32,
     pub now_unix_nanos: u64,
     pub registry: &'a ExtractorRegistry,
+    /// Owning namespace per memory id.
+    ///
+    /// **Per-memory, not batch-level.** It is tempting to carry one namespace
+    /// for the whole batch — the worker does split each drain cycle by
+    /// namespace before dispatch — but the LLM tier re-derives the owning
+    /// namespace per memory for a reason: `llm_extractor_effective_for` lets
+    /// the *system-default* extractor serve every namespace that has not
+    /// declared one of its own, so a single sub-batch legitimately spans
+    /// several tenants.
+    ///
+    /// The LLM tier resolves its credential from this, so a batch-level
+    /// approximation would bill one tenant's provider key for another
+    /// tenant's extraction. Pattern + classifier tiers ignore it.
+    ///
+    /// `None`, or an absent memory id, resolves to [`SYSTEM_NAMESPACE`].
+    pub memory_namespaces: Option<&'a HashMap<MemoryId, String>>,
     /// Items produced by earlier tiers in this cycle, keyed by
     /// memory id. The classifier tier (GLiNER) populates this so
     /// the LLM tier can reference canonical entity names in its
@@ -231,6 +247,19 @@ pub struct ExtractionContext<'a> {
     /// falls back to the labels baked in at construction; pattern + LLM tiers
     /// ignore it.
     pub entity_type_labels: Option<&'a [String]>,
+}
+
+impl ExtractionContext<'_> {
+    /// Owning namespace for `memory_id`, falling back to [`SYSTEM_NAMESPACE`].
+    ///
+    /// Centralised so the LLM tier's credential lookup and the worker's
+    /// extractor-routing cannot drift apart on what a memory's namespace is.
+    #[must_use]
+    pub fn namespace_for(&self, memory_id: MemoryId) -> &str {
+        self.memory_namespaces
+            .and_then(|m| m.get(&memory_id))
+            .map_or(SYSTEM_NAMESPACE, String::as_str)
+    }
 }
 
 // ---------------------------------------------------------------------------

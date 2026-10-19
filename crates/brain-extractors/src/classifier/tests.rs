@@ -44,6 +44,7 @@ fn memory(text: &str) -> Memory {
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,
@@ -241,6 +242,7 @@ fn per_cycle_ctx_labels_override_construction_labels() {
     let reg = ExtractorRegistry::new();
     let cycle_labels: Vec<String> = vec!["brain:Person".into(), "brain:Drug".into()];
     let cycle_ctx = ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,
