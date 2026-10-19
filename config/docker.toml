@@ -45,6 +45,18 @@ wal_retention_segments  = 16        # 1 GiB WAL retention per shard
 m              = 16
 ef_construction = 200
 ef_search      = 64
+# ef_factor: derive the search beam from the requested `k` when a query
+# gives no explicit `ef` — the beam becomes max(ef_search, k * ef_factor).
+# Range 1..=16. Default 1 = `ef_search` alone decides the beam, which is
+# what every release before this field did.
+#
+# Why it exists: at these defaults ef_search and DEFAULT_TOP_K are both 64,
+# so ef == k — the search barely explores past the results it is about to
+# return. Raising this buys recall and costs read work in proportion to k.
+# Measure on your own corpus before changing it; a small-corpus A/B moved
+# one hand-authored set (+2/12 supporting contexts) and did nothing for a
+# larger generated one, which is not enough to justify a new default.
+# ef_factor = 1
 
 [embedder]
 # BGE-small-en-v1.5 (384-dim). Cached under /var/lib/brain/models

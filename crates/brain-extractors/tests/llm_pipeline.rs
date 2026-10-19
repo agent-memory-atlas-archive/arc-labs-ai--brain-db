@@ -126,6 +126,7 @@ fn memory_in(text: &str, space: SpaceId, occurred_at_unix_nanos: Option<u64>) ->
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,
@@ -151,7 +152,8 @@ fn build_extractor(
         "acme:llm_pipeline_test".into(),
         target(),
         EXT_VERSION,
-        client,
+        Arc::new(brain_llm::FixedResolver::new(client)),
+        "claude-haiku-4-5".into(),
         cache,
         "Extract people".into(),
         None,
@@ -242,6 +244,8 @@ fn cache_row_invalidation_re_arms_call() {
         EXT_ID_RAW,
         EXT_VERSION,
         model_id_hash("claude-haiku-4-5"),
+        // Credential scope: a FixedResolver bills every namespace to HOUSE.
+        brain_llm::CredentialScope::HOUSE.get(),
     );
     {
         let mut db = cache.lock();
@@ -330,6 +334,8 @@ fn retry_cached_token_count_sums_both_calls() {
         EXT_ID_RAW,
         EXT_VERSION,
         model_id_hash("claude-haiku-4-5"),
+        // Credential scope: a FixedResolver bills every namespace to HOUSE.
+        brain_llm::CredentialScope::HOUSE.get(),
     );
     let db = cache.lock();
     let rtxn = db.read_txn().unwrap();
@@ -467,6 +473,7 @@ fn ctx_full<'a>(
     declared_entity_types: Option<&'a str>,
 ) -> ExtractionContext<'a> {
     ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types,
         candidate_predicates: None,
         declared_kinds: None,
@@ -489,7 +496,8 @@ fn build_extractor_prompt(
         "acme:llm_pipeline_test".into(),
         target(),
         EXT_VERSION,
-        client,
+        Arc::new(brain_llm::FixedResolver::new(client)),
+        "claude-haiku-4-5".into(),
         cache,
         prompt.into(),
         None,

@@ -116,6 +116,65 @@ fn dev_toml_without_provider_key_refuses_to_start() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. BYOK: per-namespace credential mode relaxes the keyless-boot invariant
+// ---------------------------------------------------------------------------
+
+#[test]
+fn broker_mode_boots_without_a_provider_key() {
+    // The whole point of BYOK: in broker mode the serving credential belongs
+    // to the tenant and is not known until a write names its namespace, so a
+    // keyless boot is correct. In static mode it remains a hard error.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_toml = MINIMAL_CONFIG.replace(
+        "[llm]\napi_key = \"sk-test-config-parser\"",
+        "[llm]\nmode = \"broker\"\n\n[llm.broker]\nurl = \"http://127.0.0.1:9900\"",
+    );
+    let path = write_tmp(&dir, &cfg_toml);
+    let cfg = Config::load_with_env(&path, &HashMap::new())
+        .expect("broker mode must boot without a provider key");
+    assert!(
+        cfg.llm.api_key.is_none(),
+        "no provider key should be required in broker mode"
+    );
+}
+
+#[test]
+fn broker_mode_without_a_broker_section_is_rejected() {
+    // A keyless boot is only legal because the broker will supply credentials.
+    // Declaring broker mode without saying where the broker is would accept a
+    // server that can never serve a single write.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_toml = MINIMAL_CONFIG.replace(
+        "[llm]\napi_key = \"sk-test-config-parser\"",
+        "[llm]\nmode = \"broker\"",
+    );
+    let path = write_tmp(&dir, &cfg_toml);
+    let err = Config::load_with_env(&path, &HashMap::new())
+        .expect_err("broker mode without [llm.broker] must fail startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("llm.broker"),
+        "expected a broker-section complaint, got: {msg}"
+    );
+}
+
+#[test]
+fn static_mode_is_the_default_and_still_requires_a_key() {
+    // Self-host must not silently become keyless: omitting `mode` keeps the
+    // pre-BYOK contract.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_toml = MINIMAL_CONFIG.replace("api_key = \"sk-test-config-parser\"", "");
+    let path = write_tmp(&dir, &cfg_toml);
+    let err = Config::load_with_env(&path, &HashMap::new())
+        .expect_err("default (static) mode without a key must fail startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("LLM provider") || msg.contains("provider key"),
+        "expected an LLM-provider startup error, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2-5. Parser (covered as unit tests in config.rs). Add one belt-and-suspenders
 //      integration check that ShardConfig wires through the deserializer.
 // ---------------------------------------------------------------------------

@@ -254,6 +254,123 @@ fn encode_replay_returns_same_response_transparently() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. BYOK: ENCODE refuses a namespace with no LLM provider credential.
+// ---------------------------------------------------------------------------
+
+/// Resolver that definitively has no credential for any namespace.
+struct NoCredentialResolver;
+
+impl brain_llm::LlmCredentialResolver for NoCredentialResolver {
+    fn client_for<'a>(
+        &'a self,
+        _namespace: &'a str,
+        _preferred_model: Option<&'a str>,
+    ) -> brain_llm::CredentialFuture<'a> {
+        Box::pin(async { brain_llm::CredentialOutcome::Missing })
+    }
+
+    fn can_serve(&self, _namespace: &str, _preferred_model: Option<&str>) -> Option<bool> {
+        Some(false)
+    }
+
+    fn missing_reason(&self, namespace: &str) -> String {
+        format!("no provider key registered for {namespace}")
+    }
+}
+
+/// Resolver that cannot answer without I/O — the cold-cache case.
+struct UnknownCredentialResolver;
+
+impl brain_llm::LlmCredentialResolver for UnknownCredentialResolver {
+    fn client_for<'a>(
+        &'a self,
+        _namespace: &'a str,
+        _preferred_model: Option<&'a str>,
+    ) -> brain_llm::CredentialFuture<'a> {
+        Box::pin(async { brain_llm::CredentialOutcome::Unavailable })
+    }
+
+    fn can_serve(&self, _namespace: &str, _preferred_model: Option<&str>) -> Option<bool> {
+        None
+    }
+}
+
+#[test]
+fn encode_without_an_llm_credential_is_rejected_at_the_door() {
+    // Brain cannot store a memory it will not be able to ground: HyPE and
+    // extraction are mandatory. Acking the write would leave it stored but
+    // with no questions, entities or statements — recall quietly degrades and
+    // nothing tells the caller why. The rejection must be terminal and name
+    // what to fix.
+    run_in_glommio(|| async {
+        use brain_ops::ErrorCode;
+
+        let mut fix = build_fixture();
+        fix.ctx = fix
+            .ctx
+            .with_llm_credential_resolver(Some(Arc::new(NoCredentialResolver)));
+
+        let err = dispatch(
+            RequestBody::Encode(encode_req([9; 16], "ungroundable")),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await
+        .expect_err("a namespace with no provider key must not accept writes");
+
+        assert_eq!(
+            err.error_code(),
+            ErrorCode::LlmCredentialMissing,
+            "must surface the dedicated terminal code, not a generic failure"
+        );
+        assert!(
+            err.to_string().contains("no provider key registered"),
+            "the error must say what the operator has to fix: {err}"
+        );
+    });
+}
+
+#[test]
+fn encode_is_admitted_when_credential_state_is_unknown() {
+    // `can_serve` returning `None` means "unknown without I/O". The
+    // synchronous write path must not block on a credential broker, and a
+    // cold cache is not evidence of a missing key — so the write is ADMITTED
+    // and the derivation stages resolve properly (and retry) when they run.
+    // Rejecting here would fail every write for the first request after a
+    // restart.
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        fix.ctx = fix
+            .ctx
+            .with_llm_credential_resolver(Some(Arc::new(UnknownCredentialResolver)));
+
+        dispatch(
+            RequestBody::Encode(encode_req([10; 16], "admitted on unknown")),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await
+        .expect("an unknown credential state must admit the write, not reject it");
+    });
+}
+
+#[test]
+fn encode_is_admitted_when_no_resolver_is_wired() {
+    // Self-host / tests / credential-free deployments wire no resolver at
+    // all. That must behave exactly as it did before BYOK existed.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        dispatch(
+            RequestBody::Encode(encode_req([11; 16], "no resolver wired")),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await
+        .expect("no resolver must admit the write");
+    });
+}
+
+// ---------------------------------------------------------------------------
 // 3. Conflict path.
 // ---------------------------------------------------------------------------
 

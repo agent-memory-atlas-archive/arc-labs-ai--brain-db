@@ -23,6 +23,15 @@ pub enum OpError {
     #[error("{what} not found: {detail}")]
     NotFound { what: &'static str, detail: String },
 
+    /// — the write's namespace has no usable LLM provider credential (BYOK).
+    ///
+    /// Terminal: retrying will not conjure a key. Raised synchronously on
+    /// ENCODE rather than letting the write ack and derivation fail quietly,
+    /// which would store the memory ungrounded with nothing telling the
+    /// caller why recall degraded.
+    #[error("no LLM provider credential for namespace {namespace}: {detail}")]
+    LlmCredentialMissing { namespace: String, detail: String },
+
     /// — idempotency mismatch on duplicate
     /// `request_id`: "same RequestId returns same
     /// response within 24h; different params → Conflict".
@@ -207,6 +216,10 @@ pub enum ErrorCode {
     /// Distinct from generic `Conflict` so clients can recognise
     /// the constraint failure and surface a domain-specific message.
     CardinalityViolation,
+    /// The write's namespace has no usable LLM provider credential (BYOK).
+    /// Maps to wire `LlmCredentialMissing` (0x0066, category Conflict).
+    /// Terminal — clients must not retry it.
+    LlmCredentialMissing,
     Overloaded,
     /// Retrieval is unavailable on this shard. Wire code
     /// reserved for admin / health diagnostics only; a normal
@@ -233,6 +246,7 @@ impl OpError {
                 _ => ErrorCode::NotFound,
             },
             Self::Conflict(_) => ErrorCode::Conflict,
+            Self::LlmCredentialMissing { .. } => ErrorCode::LlmCredentialMissing,
             Self::TxnExpired => ErrorCode::TxnExpired,
             Self::TxnNotFound => ErrorCode::TxnNotFound,
             Self::TransactionTooLarge { .. } => ErrorCode::TransactionTooLarge,

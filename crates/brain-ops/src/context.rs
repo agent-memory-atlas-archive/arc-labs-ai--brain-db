@@ -19,6 +19,7 @@ use brain_extractors::{ClassifierConfig, ExtractorRegistry};
 use brain_index::{
     EntityVectorIndex, GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard,
 };
+use brain_llm::LlmCredentialResolver;
 use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
 use brain_rerank::RerankService;
@@ -161,6 +162,19 @@ pub struct OpsContext {
     /// the registry; later ops (RECALL provenance lookups, cache
     /// admin endpoints) can read through this field directly.
     pub llm_cache: Option<Arc<Mutex<LlmCacheDb>>>,
+    /// Per-namespace LLM credential resolution (BYOK).
+    ///
+    /// ENCODE consults this **synchronously** so a namespace with no usable
+    /// provider key is rejected at the door with an actionable error, instead
+    /// of acknowledging the write and then silently failing derivation —
+    /// which would leave the memory stored but ungrounded, with nothing to
+    /// tell the caller why recall got worse.
+    ///
+    /// Only the cache-only probe (`can_serve`) is used here: the write path
+    /// must not block on a network round trip. An `Option::None` answer means
+    /// "unknown without I/O" and **admits** the write; a cold cache is not
+    /// evidence of a missing key.
+    pub llm_credential_resolver: Option<Arc<dyn LlmCredentialResolver>>,
     /// Per-shard tantivy index handle. `None` until
     /// the server's shard-spawn path wires it via
     /// [`OpsContext::with_tantivy`]. The retriever and
@@ -269,6 +283,7 @@ impl OpsContext {
             extractors_dirty: Arc::new(AtomicBool::new(false)),
             classifier_config: Arc::new(ClassifierConfig::unloaded()),
             llm_cache: None,
+            llm_credential_resolver: None,
             tantivy: None,
             memory_text_dispatcher: None,
             statement_text_dispatcher: None,
@@ -391,6 +406,18 @@ impl OpsContext {
     #[must_use]
     pub fn with_llm_cache(mut self, cache: Option<Arc<Mutex<LlmCacheDb>>>) -> Self {
         self.llm_cache = cache;
+        self
+    }
+
+    /// Install (or clear) the per-namespace LLM credential resolver. The
+    /// server calls this once at shard startup; tests and credential-free
+    /// deployments pass `None`, which admits every write.
+    #[must_use]
+    pub fn with_llm_credential_resolver(
+        mut self,
+        resolver: Option<Arc<dyn LlmCredentialResolver>>,
+    ) -> Self {
+        self.llm_credential_resolver = resolver;
         self
     }
 

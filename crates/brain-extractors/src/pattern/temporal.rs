@@ -618,6 +618,7 @@ mod tests {
 
     fn ctx(reg: &ExtractorRegistry) -> ExtractionContext<'_> {
         ExtractionContext {
+            memory_namespaces: None,
             declared_entity_types: None,
             candidate_predicates: None,
             declared_kinds: None,

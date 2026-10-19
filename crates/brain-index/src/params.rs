@@ -39,6 +39,22 @@ pub struct IndexParams {
     pub ef_search: usize,
     /// Cap on per-query `ef_search` overrides.
     pub ef_search_max: usize,
+    /// Multiplier used to derive `ef` from the requested `k` when no per-query
+    /// `ef` is given. Range: 1..=16.
+    ///
+    /// HNSW recall depends on the beam being meaningfully WIDER than the
+    /// result set. At Brain's shipped defaults `ef_search` and `DEFAULT_TOP_K`
+    /// are both 64, so `ef == k` exactly — the degenerate configuration where
+    /// the search barely explores past the results it is about to return.
+    /// Weaviate derives `ef = k * 8` for the same query, clamped to the same
+    /// 500 ceiling we already use.
+    ///
+    /// **The default is 1, which reproduces today's behaviour exactly.** It is
+    /// a knob first and a default change second: the factor raises read cost
+    /// in proportion to `k`, so the recall it buys has to be measured before
+    /// the default moves. That measurement needs the retrieval-only eval
+    /// (§6 of the accuracy plan) which does not exist yet.
+    pub ef_factor: usize,
 }
 
 impl IndexParams {
@@ -50,6 +66,8 @@ impl IndexParams {
             ef_construction: 200,
             ef_search: 64,
             ef_search_max: 500,
+            // 1 = reproduce prior behaviour. See the field's own note.
+            ef_factor: 1,
         }
     }
 
@@ -67,6 +85,9 @@ impl IndexParams {
         }
         if !(10..=500).contains(&self.ef_search) {
             return Err(IndexParamsError::EfSearchOutOfRange(self.ef_search));
+        }
+        if !(1..=16).contains(&self.ef_factor) {
+            return Err(IndexParamsError::EfFactorOutOfRange(self.ef_factor));
         }
         if self.ef_search_max < self.ef_search {
             return Err(IndexParamsError::EfSearchMaxBelowDefault {
@@ -87,6 +108,8 @@ impl Default for IndexParams {
 /// Failure to validate [`IndexParams`].
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum IndexParamsError {
+    #[error("ef_factor={0} is outside the range 1..=16")]
+    EfFactorOutOfRange(usize),
     #[error("M={0} is outside the spec range 4..=64")]
     MOutOfRange(usize),
 
@@ -163,6 +186,7 @@ mod tests {
             ef_construction: 200,
             ef_search: 100,
             ef_search_max: 50, // < ef_search
+            ef_factor: 1,
         };
         assert!(matches!(
             p.validate(),

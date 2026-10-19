@@ -10,6 +10,9 @@ description = "LLM transport clients (Anthropic, OpenAI) for Brain's LLM extract
 
 [dependencies]
 blake3 = { workspace = true }
+# Cache guard for the broker resolver's per-namespace entries. Workspace-wide
+# already; no new download.
+parking_lot = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

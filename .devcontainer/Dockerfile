@@ -41,11 +41,28 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust toolchains: stable (with rustfmt + clippy) is already in the base
-# image. Add nightly for miri + cargo-fuzz, plus the rust-src component
-# miri needs. `just` and the cargo subcommands install via cargo so the
-# image doesn't depend on third-party install scripts.
-RUN rustup component add rustfmt clippy \
+# Rust toolchains.
+#
+# `rust:1-bookworm` installs its toolchain under a CONCRETE version directory
+# (e.g. `1.99.1-aarch64-unknown-linux-gnu`) and never materialises the `stable`
+# channel alias. `rust-toolchain.toml` pins `channel = "stable"`, so rustup
+# resolves that name against the network on EVERY cargo invocation — which
+# turns any cargo command in a network-isolated container into:
+#
+#     error: could not download file from
+#     'https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256'
+#
+# Installing the channel explicitly here materialises it at build time (when
+# the network is available), so the container never reaches for it at runtime.
+# Components mirror rust-toolchain.toml so a `stable` run has what the repo
+# declares.
+#
+# Add nightly for miri + cargo-fuzz, plus the rust-src component miri needs.
+# `just` and the cargo subcommands install via cargo so the image doesn't
+# depend on third-party install scripts.
+RUN rustup toolchain install stable --profile minimal \
+        --component rustfmt --component clippy --component rust-src \
+    && rustup component add rustfmt clippy \
     && rustup toolchain install nightly --component miri --component rust-src \
     && cargo install --locked just cargo-fuzz cargo-audit cargo-nextest cargo-sweep
 

@@ -55,6 +55,49 @@ const DEFAULT_KIND: MemoryKind = MemoryKind::Episodic;
 const DEFAULT_SALIENCE: f32 = 0.5;
 
 #[tracing::instrument(name = "brain.encode", skip_all)]
+/// Reject the write when this namespace has no usable LLM provider credential.
+///
+/// Brain cannot store a memory it will not be able to ground: HyPE and the
+/// extraction tier are mandatory, so a write admitted without a credential
+/// lands as text with no questions, no entities and no statements — it looks
+/// stored, and recall quietly gets worse, with nothing telling the caller why.
+/// Failing at the door makes that visible and actionable.
+///
+/// **Cache-only.** The probe never performs I/O: the synchronous write path
+/// must not block on a credential broker. `None` means "unknown without I/O"
+/// and **admits** the write — a cold cache is not evidence of a missing key,
+/// and the derivation stages re-resolve properly (and retry a transient
+/// failure) when they run.
+fn reject_if_no_llm_credential(ctx: &OpsContext) -> Result<(), OpError> {
+    let Some(resolver) = ctx.llm_credential_resolver.as_ref() else {
+        // No resolver wired (tests, credential-free deployments): admit.
+        return Ok(());
+    };
+    let namespace = ctx.executor.caller_namespace;
+    // One point read on the hot path, and only when a resolver is wired.
+    // An unresolvable id falls back to the system namespace, matching how the
+    // extractor worker names namespaces — the two must agree or the gate and
+    // the derivation would disagree about which tenant this write belongs to.
+    let name = ctx
+        .executor
+        .metadata
+        .read_txn()
+        .ok()
+        .and_then(|rtxn| {
+            brain_metadata::namespace::namespace_name(&rtxn, namespace)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| brain_extractors::SYSTEM_NAMESPACE.to_string());
+    if resolver.can_serve(&name, None) == Some(false) {
+        return Err(OpError::LlmCredentialMissing {
+            namespace: name.clone(),
+            detail: resolver.missing_reason(&name),
+        });
+    }
+    Ok(())
+}
+
 pub async fn handle_encode(
     mut req: EncodeRequest,
     ctx: &OpsContext,
@@ -86,6 +129,7 @@ pub async fn handle_encode(
     // clarity and use the plan only as the validation gate.
     let t_validate = trace_enabled.then(Instant::now);
     let _plan = plan_encode_inner(&req, &ctx.planner_ctx)?;
+    reject_if_no_llm_credential(ctx)?;
     if let Some(start) = t_validate {
         trace_stages.push(EncodeTraceStage {
             name: "validate".into(),
