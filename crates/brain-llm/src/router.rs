@@ -10,6 +10,21 @@ use std::sync::Arc;
 
 use crate::client::LlmClient;
 
+/// Canonical wire name for OpenAI.
+///
+/// A named constant, not a literal at each use: this string is the provider
+/// field in stored BYOK credentials, a segment in the broker's URL path, and
+/// part of the AEAD binding those credentials are sealed under. A typo in any
+/// one of those places produces a decrypt failure at runtime rather than a
+/// compile error, so there is exactly one spelling.
+pub const PROVIDER_OPENAI: &str = "openai";
+
+/// Canonical wire name for Anthropic. See [`PROVIDER_OPENAI`].
+pub const PROVIDER_ANTHROPIC: &str = "anthropic";
+
+/// Name used for a model whose provider this build does not recognise.
+pub const PROVIDER_UNKNOWN: &str = "unknown";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
     Anthropic,
@@ -38,9 +53,25 @@ impl Provider {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAi => "openai",
-            Self::Unknown => "unknown",
+            Self::Anthropic => PROVIDER_ANTHROPIC,
+            Self::OpenAi => PROVIDER_OPENAI,
+            Self::Unknown => PROVIDER_UNKNOWN,
+        }
+    }
+
+    /// Parse a canonical provider name back into a [`Provider`].
+    ///
+    /// The inverse of [`Self::name`], so a provider that round-trips through
+    /// storage or a URL comes back as the same variant. Unknown names map to
+    /// [`Provider::Unknown`] rather than erroring: a newer edge may name a
+    /// provider this build cannot serve, which is version skew to degrade on,
+    /// not a malformed input to reject.
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            PROVIDER_ANTHROPIC => Self::Anthropic,
+            PROVIDER_OPENAI => Self::OpenAi,
+            _ => Self::Unknown,
         }
     }
 }
@@ -150,5 +181,44 @@ mod tests {
         assert_eq!(Provider::Anthropic.name(), "anthropic");
         assert_eq!(Provider::OpenAi.name(), "openai");
         assert_eq!(Provider::Unknown.name(), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod provider_name_tests {
+    use super::*;
+
+    #[test]
+    fn name_and_from_name_round_trip() {
+        // These strings are the provider field in stored credentials, a URL
+        // path segment, and part of the sealing AAD. If the two directions
+        // ever disagree, a credential stops opening.
+        for p in [Provider::OpenAi, Provider::Anthropic] {
+            assert_eq!(
+                Provider::from_name(p.name()),
+                p,
+                "{} must round-trip",
+                p.name()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_name_degrades_rather_than_erroring() {
+        // A newer edge may name a provider this build cannot serve.
+        assert_eq!(Provider::from_name("cohere"), Provider::Unknown);
+        assert_eq!(Provider::from_name(""), Provider::Unknown);
+    }
+
+    #[test]
+    fn classify_agrees_with_the_canonical_names() {
+        // `classify` (model prefix) and `name` must not drift apart: one
+        // decides which client serves a model, the other labels the stored
+        // credential.
+        assert_eq!(Provider::classify("gpt-4o-mini").name(), PROVIDER_OPENAI);
+        assert_eq!(
+            Provider::classify("claude-haiku-4-5").name(),
+            PROVIDER_ANTHROPIC
+        );
     }
 }

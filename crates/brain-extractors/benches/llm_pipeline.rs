@@ -132,7 +132,8 @@ fn build_extractor(
         "bench:llm".into(),
         target(),
         1,
-        client,
+        Arc::new(brain_llm::FixedResolver::new(client)),
+        "claude-haiku-4-5".into(),
         cache,
         "Extract entities".into(),
         None,
@@ -147,6 +148,7 @@ fn build_extractor(
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,

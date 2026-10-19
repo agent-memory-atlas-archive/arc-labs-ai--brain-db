@@ -147,6 +147,16 @@ pub enum ErrorCode {
     /// Implicit relation types never trigger this — they always
     /// behave as ManyToMany.
     CardinalityViolation,
+    /// The namespace this write belongs to has no usable LLM provider
+    /// credential (BYOK). **Terminal** — retrying cannot conjure a key; the
+    /// tenant must register one. Classified `Conflict` rather than
+    /// `Validation` because the request itself is well-formed: it is the
+    /// namespace's configuration state that cannot satisfy it.
+    ///
+    /// Distinct from [`Self::LlmCredentialUnavailable`], which is transient.
+    /// Collapsing the two would make a credential-broker blip look like a
+    /// permanently unconfigured tenant and reject writes that should retry.
+    LlmCredentialMissing,
 
     // Resource exhausted
     OutOfSlots,
@@ -186,6 +196,11 @@ pub enum ErrorCode {
     /// after spawn. Never returned to a normal RECALL: shards refuse to
     /// spawn if a required retriever is unwired.
     RetrieverDegraded,
+    /// The namespace's LLM credential could not be resolved right now — the
+    /// credential broker is unreachable, timed out, or returned a transient
+    /// error. **Retryable.** See [`Self::LlmCredentialMissing`] for the
+    /// terminal counterpart.
+    LlmCredentialUnavailable,
 
     // Typed-graph error codes (`0x01xx` namespace). Low-byte family
     // mirrors the typed-graph opcode ranges.
@@ -290,7 +305,8 @@ impl ErrorCode {
             | Self::TransactionTimeout
             | Self::StreamIdInUse
             | Self::SubscriptionLsnTooOld
-            | Self::CardinalityViolation => ErrorCategory::Conflict,
+            | Self::CardinalityViolation
+            | Self::LlmCredentialMissing => ErrorCategory::Conflict,
 
             // Resource-exhausted codes.
             Self::OutOfSlots
@@ -317,6 +333,7 @@ impl ErrorCode {
             | Self::Restarting
             | Self::Maintenance
             | Self::RetrieverDegraded
+            | Self::LlmCredentialUnavailable
             | Self::QueryTimeout => ErrorCategory::Unavailable,
 
             // Typed-graph validation codes.

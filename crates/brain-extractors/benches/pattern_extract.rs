@@ -60,6 +60,7 @@ fn bench_pattern_extract(c: &mut Criterion) {
     let mem = build_memory(4096);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,
@@ -84,6 +85,7 @@ fn bench_pattern_extract_short(c: &mut Criterion) {
     let mem = build_memory(256);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,
@@ -108,6 +110,7 @@ fn print_corpus_summary() {
     let mem = build_memory(4096);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,

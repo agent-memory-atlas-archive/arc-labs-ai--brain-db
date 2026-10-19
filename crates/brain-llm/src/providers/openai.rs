@@ -127,7 +127,9 @@ impl LlmClient for OpenAIClient {
     fn complete<'a>(&'a self, request: LlmRequest) -> LlmFuture<'a> {
         Box::pin(async move {
             if self.api_key.is_empty() {
-                return Err(LlmError::Auth { provider: "openai" });
+                return Err(LlmError::Auth {
+                    provider: crate::router::PROVIDER_OPENAI,
+                });
             }
 
             let body = OpenAIRequestBody::from(&request);
@@ -148,7 +150,9 @@ impl LlmClient for OpenAIClient {
 
             let status = resp.status();
             if status == 401 || status == 403 {
-                return Err(LlmError::Auth { provider: "openai" });
+                return Err(LlmError::Auth {
+                    provider: crate::router::PROVIDER_OPENAI,
+                });
             }
             if status == 429 {
                 let retry_after_ms = parse_retry_after(resp.headers());

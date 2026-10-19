@@ -145,8 +145,12 @@ pub struct Config {
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
+    /// How a namespace's credential is resolved. See [`LlmMode`].
+    #[serde(default)]
+    pub mode: LlmMode,
     /// API key for the configured model's provider. Override with
-    /// `BRAIN__LLM__API_KEY`.
+    /// `BRAIN__LLM__API_KEY`. Required in [`LlmMode::Static`]; ignored in
+    /// [`LlmMode::Broker`], where credentials are per namespace.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Model id (e.g. `gpt-4o-mini`, `claude-haiku-4-5`). The provider
@@ -154,6 +158,65 @@ pub struct LlmConfig {
     /// falls back to the built-in default when unset.
     #[serde(default)]
     pub model: Option<String>,
+    /// `[llm.broker]` — required when `mode = "broker"`.
+    #[serde(default)]
+    pub broker: Option<LlmBrokerConfig>,
+}
+
+/// How Brain resolves the LLM credential for a namespace.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmMode {
+    /// One credential, every namespace — pre-BYOK behaviour, and the
+    /// self-host default. `[llm] api_key` is mandatory: a keyless server
+    /// cannot run, because HyPE is mandatory and always-on.
+    #[default]
+    Static,
+    /// Per-namespace credentials resolved from an Arc Labs LLM broker.
+    ///
+    /// Brain holds a namespace-scoped **grant**, never the tenant's provider
+    /// key: the broker swaps the grant for the real key on the way upstream.
+    /// That keeps customer OpenAI/Anthropic keys out of Brain's WAL, snapshots
+    /// and backups.
+    ///
+    /// A keyless boot is legal here — and only here — because the credential
+    /// is not known until a write names its namespace.
+    Broker,
+}
+
+/// `[llm.broker]` — where Brain resolves per-namespace credentials.
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LlmBrokerConfig {
+    /// Base URL of the LLM broker.
+    pub url: String,
+    /// Brain's own identity to the broker. This is NOT a provider key — it
+    /// authenticates Brain so the broker will mint namespace grants for it.
+    /// Override with `BRAIN__LLM__BROKER__SERVICE_KEY`.
+    #[serde(default)]
+    pub service_key: Option<String>,
+    /// How long a resolved namespace credential stays cached before being
+    /// re-fetched. Bounds how long a revoked key keeps working.
+    #[serde(default = "default_broker_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+const fn default_broker_ttl_secs() -> u64 {
+    300
+}
+
+/// Redact the broker service key, same rule as the provider key.
+impl std::fmt::Debug for LlmBrokerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmBrokerConfig")
+            .field("url", &self.url)
+            .field(
+                "service_key",
+                &self.service_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
 }
 
 // Redact the provider key from `Debug` output. A future `debug!(?cfg)` must
@@ -162,8 +225,10 @@ pub struct LlmConfig {
 impl std::fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmConfig")
+            .field("mode", &self.mode)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("model", &self.model)
+            .field("broker", &self.broker)
             .finish()
     }
 }
@@ -212,6 +277,48 @@ pub struct HnswConfig {
     pub m: usize,
     pub ef_construction: usize,
     pub ef_search: usize,
+    /// Multiplier deriving the search beam from the requested `k` when a
+    /// query gives no explicit `ef`: the beam is `max(ef_search, k *
+    /// ef_factor)`. Range `1..=16`, validated in
+    /// [`brain_index::IndexParams::validate`].
+    ///
+    /// Defaults to `1`, which reproduces the behaviour of every release
+    /// before this field existed — `ef_search` alone decides the beam. It is
+    /// exposed so the recall/latency trade-off can be measured on real
+    /// corpora before anyone proposes moving the default; raising it costs
+    /// read work in proportion to `k`.
+    #[serde(default = "default_ef_factor")]
+    pub ef_factor: usize,
+}
+
+/// `1` — the pre-existing behaviour. See [`HnswConfig::ef_factor`].
+fn default_ef_factor() -> usize {
+    1
+}
+
+impl HnswConfig {
+    /// The index parameters this section describes.
+    ///
+    /// Lives here, not inline in `main.rs`, so it is reachable from a test.
+    /// The bug this guards against is a field that exists in `[hnsw]` and
+    /// never arrives at the index: that was true of EVERY field here until
+    /// the shard started carrying `index_params`, and it was invisible
+    /// because the config defaults match `IndexParams::default_v1()`.
+    ///
+    /// `ef_search_max` is deliberately not configurable — it is the clamp on
+    /// per-query `ef` overrides, so taking it from `default_v1()` keeps the
+    /// ceiling a property of the build rather than something a config can
+    /// raise.
+    #[must_use]
+    pub fn index_params(&self) -> brain_index::IndexParams {
+        brain_index::IndexParams {
+            m: self.m,
+            ef_construction: self.ef_construction,
+            ef_search: self.ef_search,
+            ef_search_max: brain_index::IndexParams::default_v1().ef_search_max,
+            ef_factor: self.ef_factor,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1621,6 +1728,7 @@ impl Config {
                 m: 16,
                 ef_construction: 64,
                 ef_search: 64,
+                ef_factor: 1,
             },
             embedder: EmbedderConfig {
                 model: "test".into(),
@@ -1848,23 +1956,52 @@ impl Config {
     /// — so nothing can lift this requirement: the LLM is mandatory and a
     /// missing key is always a hard startup error.
     fn validate_llm_provider(&self) -> Result<(), ConfigError> {
-        let have_provider = self
-            .llm
-            .api_key
-            .as_deref()
-            .is_some_and(|v| !v.trim().is_empty());
-        if !have_provider {
-            return Err(ConfigError::Invariant(
-                "no LLM provider key configured. Brain requires an LLM: write-time HyPE \
-                 hypothetical-question generation is mandatory and always-on, and the \
-                 write path (entity / statement / relation extraction) depends on it. \
-                 There is no way to disable HyPE or run without an LLM. \
-                 Set BRAIN__LLM__API_KEY in the environment, or `[llm] api_key` in the \
-                 config, and ensure `[llm] model` names a provider you hold a key for."
-                    .into(),
-            ));
+        match self.llm.mode {
+            // Per-namespace credentials: the serving key is not known until a
+            // write names its namespace, so there is nothing to check here
+            // beyond the broker being addressable. A keyless boot is correct
+            // in this mode — and only in this mode.
+            LlmMode::Broker => {
+                let Some(broker) = self.llm.broker.as_ref() else {
+                    return Err(ConfigError::Invariant(
+                        "`[llm] mode = \"broker\"` requires an `[llm.broker]` section with a \
+                         `url`. Without it no namespace can resolve a credential and every \
+                         write would fail at derivation time."
+                            .into(),
+                    ));
+                };
+                if broker.url.trim().is_empty() {
+                    return Err(ConfigError::Invariant(
+                        "`[llm.broker] url` is empty.".into(),
+                    ));
+                }
+                Ok(())
+            }
+            // One credential for every namespace. Unchanged from pre-BYOK: a
+            // missing key is a hard startup error, because HyPE is mandatory
+            // and always-on and there is nothing to fall back to.
+            LlmMode::Static => {
+                let have_provider = self
+                    .llm
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|v| !v.trim().is_empty());
+                if !have_provider {
+                    return Err(ConfigError::Invariant(
+                        "no LLM provider key configured. Brain requires an LLM: write-time HyPE \
+                         hypothetical-question generation is mandatory and always-on, and the \
+                         write path (entity / statement / relation extraction) depends on it. \
+                         There is no way to disable HyPE or run without an LLM. \
+                         Set BRAIN__LLM__API_KEY in the environment, or `[llm] api_key` in the \
+                         config, and ensure `[llm] model` names a provider you hold a key for. \
+                         To resolve credentials per namespace instead (BYOK), set \
+                         `[llm] mode = \"broker\"` and configure `[llm.broker]`."
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -1876,6 +2013,42 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `[hnsw]` field must arrive at the index. This is the regression
+    /// guard for the original defect: the section was parsed, validated and
+    /// then read only by a metrics label, so `ef_search = 500` in config ran
+    /// an index with `ef_search = 64` and nothing said otherwise.
+    ///
+    /// Asserted with NON-default values on purpose — equal-to-default values
+    /// are exactly what hid the bug.
+    #[test]
+    fn every_hnsw_config_field_reaches_the_index() {
+        let cfg = HnswConfig {
+            m: 32,
+            ef_construction: 300,
+            ef_search: 128,
+            ef_factor: 4,
+        };
+        let p = cfg.index_params();
+        assert_eq!(p.m, 32, "m must be carried");
+        assert_eq!(p.ef_construction, 300, "ef_construction must be carried");
+        assert_eq!(p.ef_search, 128, "ef_search must be carried");
+        assert_eq!(p.ef_factor, 4, "ef_factor must be carried");
+        // And the result must be a legal set, or the shard panics at spawn.
+        assert!(p.validate().is_ok(), "config-derived params must validate");
+    }
+
+    /// `ef_factor` is absent from every config written before it existed, so
+    /// its default has to be the value that reproduces prior behaviour.
+    #[test]
+    fn omitted_ef_factor_defaults_to_one() {
+        let cfg: HnswConfig = toml::from_str("m = 16\nef_construction = 200\nef_search = 64\n")
+            .expect("a pre-existing [hnsw] section must still parse");
+        assert_eq!(
+            cfg.ef_factor, 1,
+            "an omitted ef_factor must not change behaviour"
+        );
+    }
 
     #[test]
     fn human_bytes_binary_units() {

@@ -1225,3 +1225,55 @@ fn statement_lane_namespace_wide_never_crosses_namespaces() {
         "a foreign namespace never surfaces"
     );
 }
+
+/// `ef_factor` must be a real lever on the probe beam.
+///
+/// It was not: `HnswIndex::resolve_ef` honours `ef_factor` only when the
+/// per-query `ef` is `None`, and this retriever always passes `Some(..)`, so
+/// the knob could be set, range-validated and documented while changing
+/// nothing. These pin the two properties that matter — the default is inert,
+/// and raising it widens the beam proportionally to `k`.
+#[test]
+fn ef_factor_one_reproduces_the_previous_beam() {
+    // The floor is max(configured_ef, top_k * 1) — what the code did before
+    // ef_factor was threaded through, in the occupancy-off default.
+    assert_eq!(super::resolve_probe_ef(64, 64, 1_000, 1), 64);
+    assert_eq!(
+        super::resolve_probe_ef(64, 200, 1_000, 1),
+        200,
+        "the ef >= k invariant still holds when k exceeds configured_ef"
+    );
+    assert_eq!(super::resolve_probe_ef(128, 10, 1_000, 1), 128);
+}
+
+#[test]
+fn ef_factor_widens_the_beam_past_k() {
+    // The degenerate case the field exists for: configured_ef == top_k == 64,
+    // so a factor of 1 leaves the beam exactly as wide as the result set.
+    let degenerate = super::resolve_probe_ef(64, 64, 10_000, 1);
+    let widened = super::resolve_probe_ef(64, 64, 10_000, 8);
+    assert_eq!(degenerate, 64, "ef == k is the shipped default");
+    assert!(
+        widened > degenerate,
+        "ef_factor=8 must widen the beam (got {widened}, not > {degenerate})"
+    );
+    // max(64, 64 * 8) = 512, clamped by the hard cap. Which is itself worth
+    // knowing: at the default top_k = 64 the cap is 500, so ef_factor
+    // saturates above 7 even though `IndexParams::validate` accepts 1..=16.
+    // Raising it past that buys nothing and reads like it should.
+    assert_eq!(
+        widened, SEMANTIC_EF_SEARCH_MAX,
+        "clamped to the cap, not 512"
+    );
+}
+
+#[test]
+fn ef_factor_cannot_exceed_the_hard_cap() {
+    // A large k times a large factor must still land under the ceiling, or a
+    // single query could ask the index to explore without bound.
+    let v = super::resolve_probe_ef(64, 1_000, 10_000, 16);
+    assert_eq!(
+        v, SEMANTIC_EF_SEARCH_MAX,
+        "the cap binds regardless of k * ef_factor"
+    );
+}

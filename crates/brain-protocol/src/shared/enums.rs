@@ -383,6 +383,7 @@ pub enum ErrorCodeWire {
     StreamIdInUse = 0x0063,
     SubscriptionLsnTooOld = 0x0064,
     CardinalityViolation = 0x0065,
+    LlmCredentialMissing = 0x0066,
     // Resource exhausted
     OutOfSlots = 0x0070,
     OutOfDisk = 0x0071,
@@ -405,6 +406,7 @@ pub enum ErrorCodeWire {
     Restarting = 0x0092,
     Maintenance = 0x0093,
     RetrieverDegraded = 0x0094,
+    LlmCredentialUnavailable = 0x0095,
 
     // Typed-graph error codes (0x01xx namespace; low-byte family mirrors
     // the typed-graph opcode ranges).
@@ -473,6 +475,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::StreamIdInUse => Self::StreamIdInUse,
             ErrorCode::SubscriptionLsnTooOld => Self::SubscriptionLsnTooOld,
             ErrorCode::CardinalityViolation => Self::CardinalityViolation,
+            ErrorCode::LlmCredentialMissing => Self::LlmCredentialMissing,
             ErrorCode::OutOfSlots => Self::OutOfSlots,
             ErrorCode::OutOfDisk => Self::OutOfDisk,
             ErrorCode::OutOfMemory => Self::OutOfMemory,
@@ -492,6 +495,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::Restarting => Self::Restarting,
             ErrorCode::Maintenance => Self::Maintenance,
             ErrorCode::RetrieverDegraded => Self::RetrieverDegraded,
+            ErrorCode::LlmCredentialUnavailable => Self::LlmCredentialUnavailable,
             // Typed-graph codes (0x01xx).
             ErrorCode::SchemaInvalid => Self::SchemaInvalid,
             ErrorCode::SchemaMigrationRequired => Self::SchemaMigrationRequired,
@@ -560,6 +564,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::StreamIdInUse => Self::StreamIdInUse,
             ErrorCodeWire::SubscriptionLsnTooOld => Self::SubscriptionLsnTooOld,
             ErrorCodeWire::CardinalityViolation => Self::CardinalityViolation,
+            ErrorCodeWire::LlmCredentialMissing => Self::LlmCredentialMissing,
             ErrorCodeWire::OutOfSlots => Self::OutOfSlots,
             ErrorCodeWire::OutOfDisk => Self::OutOfDisk,
             ErrorCodeWire::OutOfMemory => Self::OutOfMemory,
@@ -579,6 +584,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::Restarting => Self::Restarting,
             ErrorCodeWire::Maintenance => Self::Maintenance,
             ErrorCodeWire::RetrieverDegraded => Self::RetrieverDegraded,
+            ErrorCodeWire::LlmCredentialUnavailable => Self::LlmCredentialUnavailable,
             // Typed-graph codes (0x01xx).
             ErrorCodeWire::SchemaInvalid => Self::SchemaInvalid,
             ErrorCodeWire::SchemaMigrationRequired => Self::SchemaMigrationRequired,
@@ -603,12 +609,60 @@ mod tests {
     use super::*;
     use crate::error::ErrorCode;
 
+    /// The BYOK contract, pinned.
+    ///
+    /// `LlmCredentialMissing` must be a NON-retryable category and
+    /// `LlmCredentialUnavailable` a retryable one. Every published SDK decides
+    /// whether to retry from this classification, so swapping them would make
+    /// a tenant with no provider key retry forever (or a transient broker blip
+    /// fail a write permanently).
+    #[test]
+    fn byok_credential_codes_carry_the_right_retry_semantics() {
+        use crate::error::ErrorCategory;
+        assert_eq!(
+            ErrorCode::LlmCredentialMissing.category(),
+            ErrorCategory::Conflict,
+            "a missing provider key is terminal — it must not be retried"
+        );
+        assert_eq!(
+            ErrorCode::LlmCredentialUnavailable.category(),
+            ErrorCategory::Unavailable,
+            "an unreachable credential broker is transient — it must be retried"
+        );
+        assert_ne!(
+            ErrorCode::LlmCredentialMissing.category(),
+            ErrorCode::LlmCredentialUnavailable.category(),
+            "collapsing these two is the bug this split exists to prevent"
+        );
+    }
+
+    /// No new `ErrorCategoryWire` variant was introduced for BYOK.
+    ///
+    /// `ErrorCategoryWire` is `repr(u8)` decoded by `serde_repr` in the Rust
+    /// SDK and a plain enum in Python; both REJECT an unknown value, so adding
+    /// a variant breaks every published 0.1.0 client. New *codes* are safe —
+    /// the SDKs type `code` as a bare number precisely so a newer server can
+    /// introduce them. This test fails if someone adds a category instead.
+    #[test]
+    fn byok_added_no_new_wire_category() {
+        assert_eq!(
+            ErrorCategoryWire::Unavailable as u8,
+            8,
+            "Unavailable must remain the highest category discriminant"
+        );
+    }
+
     /// Spec-pinned numeric values for the new codes. If these change, the
     /// wire format changed and this test catches it.
     #[test]
     fn new_codes_have_spec_numeric_values() {
         assert_eq!(ErrorCodeWire::Cancelled as u16, 0x0085);
         assert_eq!(ErrorCodeWire::RetrieverDegraded as u16, 0x0094);
+        // BYOK credential codes. Their numeric BLOCK is what assigns their
+        // category (0x006x = Conflict, 0x009x = Unavailable), so moving one
+        // silently changes whether clients retry it.
+        assert_eq!(ErrorCodeWire::LlmCredentialMissing as u16, 0x0066);
+        assert_eq!(ErrorCodeWire::LlmCredentialUnavailable as u16, 0x0095);
         assert_eq!(ErrorCodeWire::SchemaInvalid as u16, 0x0120);
         assert_eq!(ErrorCodeWire::SchemaMigrationRequired as u16, 0x0121);
         assert_eq!(ErrorCodeWire::EntityNotFound as u16, 0x0130);
@@ -633,6 +687,8 @@ mod tests {
         let codes = [
             ErrorCode::Cancelled,
             ErrorCode::RetrieverDegraded,
+            ErrorCode::LlmCredentialMissing,
+            ErrorCode::LlmCredentialUnavailable,
             ErrorCode::SchemaInvalid,
             ErrorCode::SchemaMigrationRequired,
             ErrorCode::EntityNotFound,

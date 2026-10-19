@@ -186,8 +186,10 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         {
             let mut t = wtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-            t.insert(&(expired_hash, 1u32, 1u32, 0u64), &resp).unwrap();
-            t.insert(&(fresh_hash, 1u32, 1u32, 0u64), &resp).unwrap();
+            t.insert(&(expired_hash, 1u32, 1u32, 0u64, 0u64), &resp)
+                .unwrap();
+            t.insert(&(fresh_hash, 1u32, 1u32, 0u64, 0u64), &resp)
+                .unwrap();
         }
         {
             let mut ttl = wtxn.open_table(LLM_RESPONSE_TTL_TABLE).unwrap();

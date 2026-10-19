@@ -111,6 +111,7 @@ fn memory(text: &str) -> Memory {
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,
@@ -139,18 +140,204 @@ fn build_ext(
         budget,
         Duration::from_secs(60),
         LlmExtractorInner {
-            client,
+            resolver: Arc::new(brain_llm::FixedResolver::new(client)),
+            model: "claude-haiku-4-5".into(),
             cache,
             prompt: "Extract people".into(),
             examples: None,
             response_schema: schema,
             schema_compiled,
-            pricing: Pricing::for_model("claude-haiku-4-5"),
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
         },
     )
+}
+
+// ----------------------------------------------- per-namespace credentials
+
+/// Resolver that serves a different client per namespace, and refuses one.
+///
+/// Models the BYOK case the batch-level design got wrong: the system-default
+/// extractor is effective for every namespace that has not declared its own,
+/// so one sub-batch legitimately spans several tenants.
+struct PerNamespaceResolver {
+    clients: HashMap<String, Arc<dyn LlmClient>>,
+}
+
+impl brain_llm::LlmCredentialResolver for PerNamespaceResolver {
+    fn client_for<'a>(
+        &'a self,
+        namespace: &'a str,
+        _preferred_model: Option<&'a str>,
+    ) -> brain_llm::CredentialFuture<'a> {
+        let found = self.clients.get(namespace).cloned();
+        let ns = namespace.to_string();
+        Box::pin(async move {
+            match found {
+                Some(client) => {
+                    brain_llm::CredentialOutcome::Ready(brain_llm::ResolvedCredential {
+                        client,
+                        scope: brain_llm::CredentialScope::from_identifier(&ns),
+                    })
+                }
+                None => brain_llm::CredentialOutcome::Missing,
+            }
+        })
+    }
+
+    fn can_serve(&self, namespace: &str, _preferred_model: Option<&str>) -> Option<bool> {
+        Some(self.clients.contains_key(namespace))
+    }
+}
+
+/// Flat-array response shape — one of the three `project_value` accepts.
+/// An `{"entities": [...]}` wrapper is NOT one of them and projects to zero
+/// items, which looks exactly like "wrong credential" in this test.
+fn entity_json(name: &str) -> String {
+    format!(r#"[{{"name":"{name}","confidence":0.9}}]"#)
+}
+
+/// Two memories, two namespaces, one extractor — each must be extracted with
+/// its OWN tenant's credential.
+///
+/// This is the regression guard for a batch-level `ctx.namespace`: that design
+/// compiled, passed every other test, and silently billed every memory in a
+/// mixed batch to whichever tenant happened to be first.
+#[test]
+fn each_memory_resolves_its_own_namespaces_credential() {
+    let acme: Arc<dyn LlmClient> = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(&entity_json("Acme Person"), 10))],
+    ));
+    let globex: Arc<dyn LlmClient> = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![Ok(ok_response(&entity_json("Globex Person"), 10))],
+    ));
+
+    let mut clients: HashMap<String, Arc<dyn LlmClient>> = HashMap::new();
+    clients.insert("acme".into(), acme);
+    clients.insert("globex".into(), globex);
+    let resolver = Arc::new(PerNamespaceResolver { clients });
+
+    let ext = LlmExtractor::new(
+        ExtractorId::from(99),
+        "brain:system_default".into(),
+        entity_target(),
+        1,
+        0.5,
+        None,
+        Duration::from_secs(60),
+        LlmExtractorInner {
+            resolver,
+            model: "claude-haiku-4-5".into(),
+            cache: None,
+            prompt: "Extract people".into(),
+            examples: None,
+            response_schema: None,
+            schema_compiled: None,
+            max_tokens: 1024,
+            temperature: 0.0,
+            timeout: Duration::from_secs(30),
+        },
+    );
+
+    // Distinct slots: `memory()` pins one MemoryId, and two memories sharing
+    // an id would collapse into a single namespace-map entry.
+    let mut mem_a = memory("Acme Person works at Acme.");
+    mem_a.id = MemoryId::pack(0, 1, 0);
+    let mut mem_g = memory("Globex Person works at Globex.");
+    mem_g.id = MemoryId::pack(0, 2, 0);
+    assert_ne!(mem_a.id, mem_g.id);
+    let mut ns: HashMap<MemoryId, String> = HashMap::new();
+    ns.insert(mem_a.id, "acme".into());
+    ns.insert(mem_g.id, "globex".into());
+
+    let reg = ExtractorRegistry::new();
+    let mut c = ctx(&reg);
+    c.memory_namespaces = Some(&ns);
+
+    let ra = futures_lite::future::block_on(ext.run(&c, &mem_a));
+    let rg = futures_lite::future::block_on(ext.run(&c, &mem_g));
+
+    // Each memory reached its own tenant's client — proven by the distinct
+    // response each mock was primed with.
+    assert_eq!(
+        ra.status,
+        ExtractionStatus::Success,
+        "{:?}",
+        ra.status_reason
+    );
+    assert_eq!(
+        rg.status,
+        ExtractionStatus::Success,
+        "{:?}",
+        rg.status_reason
+    );
+    assert!(
+        ra.items
+            .iter()
+            .any(|i| matches!(i, ExtractedItem::EntityMention(e) if e.text == "Acme Person")),
+        "acme memory got the wrong tenant's completion: {:?}",
+        ra.items
+    );
+    assert!(
+        rg.items
+            .iter()
+            .any(|i| matches!(i, ExtractedItem::EntityMention(e) if e.text == "Globex Person")),
+        "globex memory got the wrong tenant's completion: {:?}",
+        rg.items
+    );
+}
+
+/// A namespace with no credential is skipped as disabled, not failed — and
+/// crucially does not fall back to some other tenant's key.
+#[test]
+fn memory_in_a_namespace_without_a_credential_is_skipped() {
+    let acme: Arc<dyn LlmClient> = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(&entity_json("Acme Person"), 10))],
+    ));
+    let mut clients: HashMap<String, Arc<dyn LlmClient>> = HashMap::new();
+    clients.insert("acme".into(), acme);
+    let resolver = Arc::new(PerNamespaceResolver { clients });
+
+    let ext = LlmExtractor::new(
+        ExtractorId::from(99),
+        "brain:system_default".into(),
+        entity_target(),
+        1,
+        0.5,
+        None,
+        Duration::from_secs(60),
+        LlmExtractorInner {
+            resolver,
+            model: "claude-haiku-4-5".into(),
+            cache: None,
+            prompt: "Extract people".into(),
+            examples: None,
+            response_schema: None,
+            schema_compiled: None,
+            max_tokens: 1024,
+            temperature: 0.0,
+            timeout: Duration::from_secs(30),
+        },
+    );
+
+    let mem = memory("unfunded tenant memory");
+    let mut ns: HashMap<MemoryId, String> = HashMap::new();
+    ns.insert(mem.id, "no-key-tenant".into());
+
+    let reg = ExtractorRegistry::new();
+    let mut c = ctx(&reg);
+    c.memory_namespaces = Some(&ns);
+
+    let r = futures_lite::future::block_on(ext.run(&c, &mem));
+    assert_eq!(r.status, ExtractionStatus::SkippedDisabled);
+    assert!(
+        r.items.is_empty(),
+        "no items may come from another tenant's key"
+    );
 }
 
 // ------------------------------------------------------------------- tests
@@ -356,13 +543,13 @@ fn ext_with_prompt(prompt: &str) -> LlmExtractor {
         None,
         Duration::from_secs(60),
         LlmExtractorInner {
-            client,
+            resolver: Arc::new(brain_llm::FixedResolver::new(client)),
+            model: "claude-haiku-4-5".into(),
             cache: None,
             prompt: prompt.into(),
             examples: None,
             response_schema: None,
             schema_compiled,
-            pricing: Pricing::for_model("claude-haiku-4-5"),
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -383,6 +570,7 @@ fn build_request_injects_prior_entities_into_prompt() {
     let prior_refs: Vec<&EntityMention> = priors.iter().collect();
     let (req, _) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         brain_core::MemoryId::pack(0, 1, 0),
         "Alice Wong works at Acme Corp from Bengaluru.",
         &prior_refs,
@@ -427,6 +615,7 @@ fn build_request_substitutes_anchor_date_placeholder() {
     let inner = ext.inner.as_ref().unwrap().clone();
     let (req, _) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         brain_core::MemoryId::pack(0, 1, 0),
         "Ran a race last Saturday.",
         &[],
@@ -455,6 +644,7 @@ fn build_request_anchor_date_empty_when_absent() {
     let inner = ext.inner.as_ref().unwrap().clone();
     let (req, _) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         brain_core::MemoryId::pack(0, 1, 0),
         "No date here.",
         &[],
@@ -499,6 +689,7 @@ fn build_request_with_empty_prior_entities_omits_section() {
     let priors: Vec<&EntityMention> = Vec::new();
     let (req, _) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         brain_core::MemoryId::pack(0, 2, 0),
         "Plain text.",
         &priors,
@@ -530,6 +721,7 @@ fn build_request_filters_non_entity_items_from_prior() {
     let priors: Vec<&EntityMention> = vec![&em1, &em2];
     let (req, _) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         brain_core::MemoryId::pack(0, 3, 0),
         "Alice met Acme.",
         &priors,
@@ -565,6 +757,7 @@ fn build_request_filters_non_entity_items_from_prior() {
     );
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+        memory_namespaces: None,
         declared_entity_types: None,
         candidate_predicates: None,
         declared_kinds: None,
@@ -606,13 +799,13 @@ fn build_request_splits_into_cached_blocks() {
         None,
         Duration::from_secs(60),
         LlmExtractorInner {
-            client,
+            resolver: Arc::new(brain_llm::FixedResolver::new(client)),
+            model: "claude-haiku-4-5".into(),
             cache: None,
             prompt: "Extract things.\n{TEXT}".into(),
             examples: Some(examples),
             response_schema: None,
             schema_compiled,
-            pricing: Pricing::for_model("claude-haiku-4-5"),
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -621,6 +814,7 @@ fn build_request_splits_into_cached_blocks() {
     let inner = ext.inner.as_ref().unwrap().clone();
     let (req, _) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         brain_core::MemoryId::pack(0, 1, 0),
         "Alice met Bob.",
         &[],
@@ -679,13 +873,13 @@ fn build_request_without_examples_emits_role_block_only() {
         None,
         Duration::from_secs(60),
         LlmExtractorInner {
-            client,
+            resolver: Arc::new(brain_llm::FixedResolver::new(client)),
+            model: "claude-haiku-4-5".into(),
             cache: None,
             prompt: "Extract.\n{TEXT}".into(),
             examples: None,
             response_schema: None,
             schema_compiled,
-            pricing: Pricing::for_model("claude-haiku-4-5"),
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -694,6 +888,7 @@ fn build_request_without_examples_emits_role_block_only() {
     let inner = ext.inner.as_ref().unwrap().clone();
     let (req, _) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         brain_core::MemoryId::pack(0, 1, 0),
         "Hello.",
         &[],
@@ -774,7 +969,8 @@ fn extractor_with_mock(mock: Arc<MockClient>) -> LlmExtractor {
             kind: StatementKindAst::Fact,
         },
         1,
-        mock,
+        Arc::new(brain_llm::FixedResolver::new(mock)),
+        "claude-haiku-4-5".into(),
         None,
         "ignored prompt".into(),
         None,
@@ -849,7 +1045,8 @@ fn judge_supersedes_returns_supersede_verdict() {
 
     let (old, new) = fact_pair(entity_id(), brain_core::PredicateId::from(1));
     let verdict =
-        futures_lite::future::block_on(ext.judge_supersedes_call(&new, &old, &rtxn)).unwrap();
+        futures_lite::future::block_on(ext.judge_supersedes_call("acme", &new, &old, &rtxn))
+            .unwrap();
     assert_eq!(verdict, JudgeVerdict::Supersedes);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -870,8 +1067,8 @@ fn judge_supersedes_degraded_extractor_errors() {
     let md = open_md(&tmp);
     let rtxn = md.read_txn().unwrap();
     let (old, new) = fact_pair(entity_id(), brain_core::PredicateId::from(1));
-    let err =
-        futures_lite::future::block_on(ext.judge_supersedes_call(&new, &old, &rtxn)).unwrap_err();
+    let err = futures_lite::future::block_on(ext.judge_supersedes_call("acme", &new, &old, &rtxn))
+        .unwrap_err();
     matches!(err, JudgeError::Transport(_))
         .then_some(())
         .expect("expected Transport error from degraded extractor");
@@ -888,7 +1085,8 @@ fn judge_supersedes_budget_blocks_call() {
             kind: StatementKindAst::Fact,
         },
         1,
-        mock,
+        Arc::new(brain_llm::FixedResolver::new(mock)),
+        "claude-haiku-4-5".into(),
         None,
         "ignored".into(),
         None,
@@ -906,8 +1104,8 @@ fn judge_supersedes_budget_blocks_call() {
     let md = open_md(&tmp);
     let rtxn = md.read_txn().unwrap();
     let (old, new) = fact_pair(entity_id(), brain_core::PredicateId::from(1));
-    let err =
-        futures_lite::future::block_on(ext.judge_supersedes_call(&new, &old, &rtxn)).unwrap_err();
+    let err = futures_lite::future::block_on(ext.judge_supersedes_call("acme", &new, &old, &rtxn))
+        .unwrap_err();
     matches!(err, JudgeError::Budget(_))
         .then_some(())
         .expect("expected Budget error");
@@ -929,8 +1127,8 @@ fn judge_supersedes_unparseable_response_errors() {
     let md = open_md(&tmp);
     let rtxn = md.read_txn().unwrap();
     let (old, new) = fact_pair(entity_id(), brain_core::PredicateId::from(1));
-    let err =
-        futures_lite::future::block_on(ext.judge_supersedes_call(&new, &old, &rtxn)).unwrap_err();
+    let err = futures_lite::future::block_on(ext.judge_supersedes_call("acme", &new, &old, &rtxn))
+        .unwrap_err();
     matches!(err, JudgeError::Parse(_))
         .then_some(())
         .expect("expected Parse error");
@@ -979,6 +1177,7 @@ fn extract_with_context_includes_neighbors_in_prompt() {
     };
     let (req, stats) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         mid,
         "Alice approved the design.",
         &[],
@@ -1030,6 +1229,7 @@ fn extract_with_context_drops_summary_when_over_budget() {
     };
     let (_req, stats) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         mid,
         &memory_text,
         &[],
@@ -1085,6 +1285,7 @@ fn extract_with_context_drops_lowest_similarity_neighbors_when_over_budget() {
     };
     let (req, stats) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         mid,
         &memory_text,
         &[],
@@ -1129,6 +1330,7 @@ fn extract_with_context_includes_summary_when_under_budget() {
     };
     let (req, stats) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         mid,
         "today",
         &[],
@@ -1154,6 +1356,7 @@ fn extract_with_context_skips_sections_when_context_is_empty() {
     let ec = ExtractorContext::empty();
     let (req, stats) = ext.build_request(
         &inner,
+        "claude-haiku-4-5",
         mid,
         "first memory ever",
         &[],
@@ -1247,13 +1450,13 @@ fn build_ext_with_target(
         None,
         Duration::from_secs(60),
         LlmExtractorInner {
-            client,
+            resolver: Arc::new(brain_llm::FixedResolver::new(client)),
+            model: "claude-haiku-4-5".into(),
             cache: None,
             prompt: "ignored in mock".into(),
             examples: None,
             response_schema: Some(schema),
             schema_compiled,
-            pricing: Pricing::for_model("gpt-4o-mini"),
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),

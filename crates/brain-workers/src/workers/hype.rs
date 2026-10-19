@@ -26,7 +26,7 @@ use brain_core::MemoryId;
 use brain_embed::Dispatcher;
 use brain_index::HypeHnswIndex;
 use brain_llm::types::SystemBlock;
-use brain_llm::{LlmClient, LlmMessage, LlmRequest, LlmRole};
+use brain_llm::{CredentialOutcome, LlmCredentialResolver, LlmMessage, LlmRequest, LlmRole};
 use brain_metadata::llm_cache::{LlmResponse as CachedResponse, LLM_RESPONSES_TABLE};
 use brain_metadata::{
     hype_neighborhood_hash_get, hype_neighborhood_hash_put, hype_vector_put,
@@ -54,7 +54,14 @@ const MAX_QUESTIONS_PER_MEMORY: usize = 16;
 /// skips generation entirely.
 #[derive(Clone)]
 pub struct HypeGenerator {
-    client: Arc<dyn LlmClient>,
+    /// Resolves the credential for the namespace a memory belongs to.
+    ///
+    /// Was a single `Arc<dyn LlmClient>` fixed at shard spawn. Under BYOK the
+    /// key that pays for HyPE generation must be the owning tenant's — HyPE is
+    /// mandatory and runs on every write, so it is the largest LLM cost on the
+    /// write path and the one most visibly mis-billed if it is wrong.
+    resolver: Arc<dyn LlmCredentialResolver>,
+    /// Declared model preference, passed to the resolver.
     model: String,
     embedder: Arc<dyn Dispatcher>,
     index: Arc<RwLock<HypeHnswIndex>>,
@@ -77,7 +84,7 @@ pub struct HypeGenOutcome {
 
 impl HypeGenerator {
     pub fn new(
-        client: Arc<dyn LlmClient>,
+        resolver: Arc<dyn LlmCredentialResolver>,
         model: String,
         embedder: Arc<dyn Dispatcher>,
         index: Arc<RwLock<HypeHnswIndex>>,
@@ -86,7 +93,7 @@ impl HypeGenerator {
         num_questions: usize,
     ) -> Self {
         Self {
-            client,
+            resolver,
             model,
             embedder,
             index,
@@ -114,6 +121,7 @@ impl HypeGenerator {
     /// LLM call.
     pub async fn generate_for(
         &self,
+        namespace: &str,
         memory_id: MemoryId,
         text: &str,
         neighborhood: &str,
@@ -122,7 +130,8 @@ impl HypeGenerator {
             return HypeGenOutcome::default();
         }
 
-        let (questions, cost_micro) = match self.questions_for(text, neighborhood).await {
+        let (questions, cost_micro) = match self.questions_for(namespace, text, neighborhood).await
+        {
             Ok(qs) => qs,
             Err(e) => {
                 tracing::warn!(
@@ -230,6 +239,7 @@ impl HypeGenerator {
     /// redb point read, no LLM). Best-effort, like [`Self::generate_for`].
     pub async fn refresh_for(
         &self,
+        namespace: &str,
         memory_id: MemoryId,
         text: &str,
         neighborhood: &str,
@@ -248,7 +258,8 @@ impl HypeGenerator {
             }
         }
 
-        let (questions, cost_micro) = match self.questions_for(text, neighborhood).await {
+        let (questions, cost_micro) = match self.questions_for(namespace, text, neighborhood).await
+        {
             Ok(qs) => qs,
             Err(e) => {
                 tracing::warn!(
@@ -341,6 +352,7 @@ impl HypeGenerator {
     /// model and writes the reply back.
     async fn questions_for(
         &self,
+        namespace: &str,
         text: &str,
         neighborhood: &str,
     ) -> Result<(Vec<String>, u64), String> {
@@ -348,15 +360,32 @@ impl HypeGenerator {
         // richer graph around it should regenerate (different bridge
         // questions), so a neighborhood change must miss the cache.
         let input_hash = input_hash(text, neighborhood);
-        let model_id_hash = self.client.model_id_hash();
 
-        if let Some(blob) = self.cache_get(input_hash, model_id_hash) {
+        // Resolve before touching the cache: the credential scope is part of
+        // the cache key, so a lookup without it could serve a row another
+        // tenant's key paid for.
+        let credential = match self.resolver.client_for(namespace, Some(&self.model)).await {
+            CredentialOutcome::Ready(c) => c,
+            CredentialOutcome::Missing => {
+                return Err(format!("hype: {}", self.resolver.missing_reason(namespace)));
+            }
+            CredentialOutcome::Unavailable => {
+                return Err(format!(
+                    "hype: llm credential for namespace {namespace} unavailable"
+                ));
+            }
+        };
+        let client = credential.client.clone();
+        let model_id_hash = client.model_id_hash();
+        let scope = credential.scope.get();
+
+        if let Some(blob) = self.cache_get(input_hash, model_id_hash, scope) {
             let raw = String::from_utf8_lossy(&blob);
             return Ok((parse_questions(&raw, self.num_questions), 0));
         }
 
         let req = LlmRequest {
-            model: self.model.clone(),
+            model: client.model().to_string(),
             system_blocks: vec![SystemBlock::cached(Self::system_prompt())],
             messages: vec![LlmMessage {
                 role: LlmRole::User,
@@ -367,8 +396,7 @@ impl HypeGenerator {
             max_tokens: 256,
             timeout: Duration::from_secs(30),
         };
-        let resp = self
-            .client
+        let resp = client
             .complete(req)
             .await
             .map_err(|e| format!("hype llm transport: {e}"))?;
@@ -381,6 +409,7 @@ impl HypeGenerator {
             self.cache_put(
                 input_hash,
                 model_id_hash,
+                scope,
                 resp.content.clone().into_bytes(),
                 resp.tokens_out as u32,
             );
@@ -420,7 +449,7 @@ do not use pronouns.\n\nText:\n{text}\n\nConnected facts:\n{neighborhood}"
         )
     }
 
-    fn cache_get(&self, input_hash: [u8; 32], model_id_hash: u64) -> Option<Vec<u8>> {
+    fn cache_get(&self, input_hash: [u8; 32], model_id_hash: u64, scope: u64) -> Option<Vec<u8>> {
         let db = self.cache.lock();
         let rtxn = db.read_txn().ok()?;
         let t = rtxn.open_table(LLM_RESPONSES_TABLE).ok()?;
@@ -429,12 +458,20 @@ do not use pronouns.\n\nText:\n{text}\n\nConnected facts:\n{neighborhood}"
             HYPE_CACHE_EXTRACTOR_ID,
             HYPE_CACHE_VERSION,
             model_id_hash,
+            scope,
         );
         let row = t.get(&key).ok().flatten()?;
         Some(row.value().response_blob)
     }
 
-    fn cache_put(&self, input_hash: [u8; 32], model_id_hash: u64, blob: Vec<u8>, tokens: u32) {
+    fn cache_put(
+        &self,
+        input_hash: [u8; 32],
+        model_id_hash: u64,
+        scope: u64,
+        blob: Vec<u8>,
+        tokens: u32,
+    ) {
         let now_nanos = now_unix_nanos();
         let expires = now_nanos.saturating_add(HYPE_CACHE_TTL.as_nanos() as u64);
         let mut db = self.cache.lock();
@@ -446,6 +483,7 @@ do not use pronouns.\n\nText:\n{text}\n\nConnected facts:\n{neighborhood}"
             HYPE_CACHE_EXTRACTOR_ID,
             HYPE_CACHE_VERSION,
             model_id_hash,
+            scope,
         );
         let value = CachedResponse::new(blob, now_nanos, expires, tokens, model_id_hash);
         {

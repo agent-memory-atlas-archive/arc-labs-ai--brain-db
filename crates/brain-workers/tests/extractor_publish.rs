@@ -469,7 +469,7 @@ async fn shard_registry_with_real_gliner_persists_entities() {
         llm_max_tokens: None,
         classifier_model: Some(Arc::new(model)),
         entity_type_qnames: Arc::new(entity_type_qnames),
-        model_router: None,
+        credential_resolver: None,
         llm_cache: None,
     };
     let (registry, errors) = brain_extractors::build_registry_from_definitions(&defs, &deps);
@@ -770,7 +770,7 @@ fn build_hype_generator(
         cost_micro_usd,
     });
     HypeGenerator::new(
-        client,
+        Arc::new(brain_llm::FixedResolver::new(client)),
         "fake-hype-model".to_string(),
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
         index,

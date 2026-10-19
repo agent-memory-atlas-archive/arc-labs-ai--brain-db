@@ -15,6 +15,7 @@ brain-planner = { path = "../brain-planner" }
 brain-embed = { path = "../brain-embed" }
 brain-extractors = { path = "../brain-extractors" }
 brain-index = { path = "../brain-index" }
+brain-llm = { path = "../brain-llm" }
 brain-metadata = { path = "../brain-metadata" }
 brain-rerank = { path = "../brain-rerank" }
 brain-storage = { path = "../brain-storage" }

@@ -1,6 +1,7 @@
 //! `LlmExtractor` — Tier 3 of the extractor pipeline.
 //!
-//! Wraps an [`LlmClient`] (Anthropic / OpenAI) behind the
+//! Resolves a [`brain_llm::LlmClient`] (Anthropic / OpenAI) per namespace
+//! through a [`brain_llm::LlmCredentialResolver`] and presents it behind the
 //! [`Extractor`] trait. Adds a per-shard response cache, a per-call
 //! cost budget, JSON-schema validation with one retry on schema
 //! failure, and output projection to `EntityMention` /
@@ -22,7 +23,9 @@ use std::time::Duration;
 use brain_core::{ExtractorId, Memory};
 use brain_core::{ExtractorKind, Statement, StatementObject, StatementValue, SubjectRef};
 use brain_llm::types::SystemBlock;
-use brain_llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmRole};
+use brain_llm::{
+    CredentialOutcome, LlmCredentialResolver, LlmError, LlmMessage, LlmRequest, LlmRole,
+};
 use brain_metadata::entity::ops::entity_get;
 use brain_metadata::schema::predicate::predicate_get;
 use brain_metadata::statement::{JudgeError, JudgeFuture, JudgeVerdict, StatementJudge};
@@ -90,7 +93,19 @@ pub struct LlmExtractor {
 /// Fully-wired inner state. Held behind `Option` so degraded
 /// extractors can carry just `degraded_reason`.
 pub struct LlmExtractorInner {
-    pub client: Arc<dyn LlmClient>,
+    /// Resolves which credential serves a given namespace.
+    ///
+    /// Pre-BYOK this was a single `Arc<dyn LlmClient>` baked in at shard
+    /// startup. It cannot stay that way: under BYOK the credential depends on
+    /// whose memory is being extracted, which is not known until dispatch. A
+    /// single-key deployment wires a `StaticResolver` here and behaves exactly
+    /// as before.
+    pub resolver: Arc<dyn LlmCredentialResolver>,
+    /// The `model:` field declared on the extractor definition, passed to the
+    /// resolver as a preference. A static resolver honours it exactly; a
+    /// broker-backed one serves whatever model the namespace's key can pay
+    /// for.
+    pub model: String,
     pub cache: Option<Arc<Mutex<LlmCacheDb>>>,
     pub prompt: String,
     pub examples: Option<Value>,
@@ -98,7 +113,6 @@ pub struct LlmExtractorInner {
     /// Compiled draft-7 validator. `None` when `response_schema`
     /// is absent (free-form response mode).
     pub schema_compiled: Option<JSONSchema>,
-    pub pricing: Pricing,
     pub max_tokens: u32,
     pub temperature: f32,
     pub timeout: Duration,
@@ -165,7 +179,8 @@ impl LlmExtractor {
         name: String,
         target: ExtractorTarget,
         extractor_version: u32,
-        client: Arc<dyn LlmClient>,
+        resolver: Arc<dyn LlmCredentialResolver>,
+        model: String,
         cache: Option<Arc<Mutex<LlmCacheDb>>>,
         prompt: String,
         examples: Option<Value>,
@@ -176,7 +191,6 @@ impl LlmExtractor {
         cache_ttl: Duration,
         max_tokens: Option<u32>,
     ) -> Self {
-        let pricing = Pricing::for_model(client.model());
         Self::new(
             id,
             name,
@@ -186,13 +200,13 @@ impl LlmExtractor {
             cost_budget,
             cache_ttl,
             LlmExtractorInner {
-                client,
+                resolver,
+                model,
                 cache,
                 prompt,
                 examples,
                 response_schema,
                 schema_compiled,
-                pricing,
                 max_tokens: max_tokens.unwrap_or(DEFAULT_LLM_MAX_TOKENS),
                 temperature: 0.0,
                 timeout: Duration::from_secs(30),
@@ -249,6 +263,9 @@ impl LlmExtractor {
     pub(super) fn build_request(
         &self,
         inner: &LlmExtractorInner,
+        // Model id of the credential resolved for this call — not
+        // `inner.model`, which is only the declared preference.
+        model: &str,
         memory_id: brain_core::MemoryId,
         memory_text: &str,
         prior_entities: &[&EntityMention],
@@ -289,7 +306,7 @@ impl LlmExtractor {
         // message and is never cached — that's the surface area that
         // carries the bounded inferential context.
         let request = LlmRequest {
-            model: inner.client.model().to_string(),
+            model: model.to_string(),
             system_blocks: build_extractor_system_blocks(inner.examples.as_ref()),
             messages: vec![brain_llm::LlmMessage {
                 role: brain_llm::LlmRole::User,
@@ -489,14 +506,20 @@ impl LlmExtractor {
     /// (typically `[0.82, 0.92)`). Returns `Supersedes` /
     /// `Contradicts` / `Coexists` per the prompt below.
     ///
-    /// The judge reuses the LLM extractor's wired client + cache + cost
+    /// The judge reuses the LLM extractor's wired resolver + cache + cost
     /// budget so deployments don't need a second transport — the
     /// per-call budget guards against runaway costs, and the role
     /// block ships through the same Anthropic prompt-cache breakpoint
     /// as the extractor's role block so the steady-state input-token
     /// bill collapses on repeated judge invocations.
+    ///
+    /// The credential is resolved from **`namespace`**: a judgement about a
+    /// tenant's statements is billed to that tenant's key, the same as the
+    /// extraction that produced them. Without this the judge would quietly run
+    /// on the house key while extraction ran on the tenant's.
     pub async fn judge_supersedes_call(
         &self,
+        namespace: &str,
         new: &Statement,
         existing: &Statement,
         rtxn: &ReadTransaction,
@@ -522,8 +545,32 @@ impl LlmExtractor {
              Respond with exactly one word: SUPERSEDES, CONTRADICTS, or COEXISTS."
         );
 
+        // Bill the judgement to the namespace whose statements are being
+        // judged. `Unavailable` maps to Transport (the tier retries);
+        // `Missing` is a budget-class refusal the operator can act on.
+        let credential = match inner
+            .resolver
+            .client_for(namespace, Some(&inner.model))
+            .await
+        {
+            CredentialOutcome::Ready(c) => c,
+            CredentialOutcome::Missing => {
+                return Err(JudgeError::Transport(format!(
+                    "judge unavailable: {}",
+                    inner.resolver.missing_reason(namespace)
+                )));
+            }
+            CredentialOutcome::Unavailable => {
+                return Err(JudgeError::Transport(format!(
+                    "judge unavailable: llm credential for namespace {namespace} could not be resolved"
+                )));
+            }
+        };
+        let client = credential.client.clone();
+        let pricing = Pricing::for_model(client.model());
+
         let request = LlmRequest {
-            model: inner.client.model().to_string(),
+            model: client.model().to_string(),
             system_blocks: vec![SystemBlock::cached(JUDGE_ROLE_BLOCK)],
             messages: vec![LlmMessage {
                 role: LlmRole::User,
@@ -538,7 +585,7 @@ impl LlmExtractor {
         };
 
         if let Some(budget) = self.cost_budget {
-            let est = estimate_cost(&request, &inner.pricing);
+            let est = estimate_cost(&request, &pricing);
             if est > budget.per_call_micro_usd {
                 return Err(JudgeError::Budget(format!(
                     "estimated {} µ$ exceeds per-call budget {} µ$",
@@ -547,8 +594,7 @@ impl LlmExtractor {
             }
         }
 
-        let resp = inner
-            .client
+        let resp = client
             .complete(request)
             .await
             .map_err(|e| JudgeError::Transport(llm_error_reason(&e)))?;
@@ -633,12 +679,13 @@ fn render_value(v: &StatementValue) -> String {
 impl StatementJudge for LlmExtractor {
     fn judge_supersedes<'a>(
         &'a self,
+        namespace: &'a str,
         new_stmt: &'a Statement,
         existing_stmt: &'a Statement,
         rtxn: &'a ReadTransaction,
     ) -> JudgeFuture<'a> {
         Box::pin(async move {
-            self.judge_supersedes_call(new_stmt, existing_stmt, rtxn)
+            self.judge_supersedes_call(namespace, new_stmt, existing_stmt, rtxn)
                 .await
         })
     }
@@ -1450,6 +1497,49 @@ impl Extractor for LlmExtractor {
                 );
             };
             let inner = inner.clone();
+
+            // Which credential serves this memory's namespace. Resolved per
+            // dispatch rather than baked at startup, because under BYOK it
+            // depends on whose memory this is. Resolvers cache, so the steady
+            // state is a map lookup.
+            //
+            // `Missing` is terminal — the tenant has no key and retrying will
+            // not conjure one, so this is a SkippedDisabled audit row carrying
+            // an operator-actionable reason. `Unavailable` is NOT terminal: it
+            // is a transport-class failure so the worker retries with backoff
+            // instead of permanently dropping this memory's grounding.
+            // Per memory, not per batch: the system-default extractor serves
+            // every namespace without its own, so sibling memories in one
+            // sub-batch can belong to different tenants and therefore
+            // different credentials.
+            let mem_namespace = ctx.namespace_for(mem.id);
+            let credential = match inner
+                .resolver
+                .client_for(mem_namespace, Some(&inner.model))
+                .await
+            {
+                CredentialOutcome::Ready(c) => c,
+                CredentialOutcome::Missing => {
+                    return ExtractionResult::skipped(
+                        ExtractionStatus::SkippedDisabled,
+                        inner.resolver.missing_reason(mem_namespace),
+                        started,
+                    );
+                }
+                CredentialOutcome::Unavailable => {
+                    return ExtractionResult::failure(
+                        format!(
+                            "llm credential for namespace {mem_namespace} unavailable; retrying"
+                        ),
+                        started,
+                        started,
+                    )
+                    .with_failure_class(ExtractionFailureClass::Transient);
+                }
+            };
+            let client = credential.client.clone();
+            let pricing = Pricing::for_model(client.model());
+
             let text = mem.text.as_deref().unwrap_or("");
             // Cache key hashes the full materialized prompt context (text +
             // anchor date + declared types/kinds + candidate predicates +
@@ -1459,7 +1549,8 @@ impl Extractor for LlmExtractor {
             // of those changed — and would leak one tenant's extraction to
             // another for byte-identical text.
             let input_hash = self.cache_input_hash(ctx, mem);
-            let model_id_hash = inner.client.model_id_hash();
+            let model_id_hash = client.model_id_hash();
+            let credential_scope = credential.scope.get();
             let extractor_id_raw = self.id.raw();
             let extractor_version = self.extractor_version;
 
@@ -1471,6 +1562,7 @@ impl Extractor for LlmExtractor {
                     extractor_id_raw,
                     extractor_version,
                     model_id_hash,
+                    credential_scope,
                 ) {
                     return match decode_cached(&row.response_blob, inner.response_schema.as_ref()) {
                         Ok(parsed) => {
@@ -1513,6 +1605,7 @@ impl Extractor for LlmExtractor {
             let anchor_date = anchor_date_iso(mem);
             let (mut request, _stats) = self.build_request(
                 &inner,
+                client.model(),
                 mem.id,
                 text,
                 &prior_entities,
@@ -1524,7 +1617,7 @@ impl Extractor for LlmExtractor {
                 started,
             );
             if let Some(budget) = self.cost_budget {
-                let est = estimate_cost(&request, &inner.pricing);
+                let est = estimate_cost(&request, &pricing);
                 if est > budget.per_call_micro_usd {
                     let reason = format!(
                         "estimated {} µ$ exceeds per-call budget {} µ$",
@@ -1551,7 +1644,7 @@ impl Extractor for LlmExtractor {
             let mut total_tokens: u64 = 0;
 
             // ----- 3. First LLM call -------------------------------------------
-            let resp1 = match inner.client.complete(request.clone()).await {
+            let resp1 = match client.complete(request.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     return ExtractionResult::failure(llm_error_reason(&e), started, started)
@@ -1621,7 +1714,7 @@ impl Extractor for LlmExtractor {
                                  Error: {err1}. Please retry with valid JSON."
                             ),
                         });
-                        let resp2 = match inner.client.complete(request).await {
+                        let resp2 = match client.complete(request).await {
                             Ok(r) => r,
                             Err(e) => {
                                 // The first call already billed real provider
@@ -1704,6 +1797,7 @@ impl Extractor for LlmExtractor {
                     extractor_id_raw,
                     extractor_version,
                     model_id_hash,
+                    credential_scope,
                     blob,
                     token_count,
                     started,

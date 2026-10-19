@@ -250,8 +250,16 @@ pub type JudgeFuture<'a> =
 /// where the LLM client + prompt cache + budget enforcement already
 /// reside.
 pub trait StatementJudge: Send + Sync {
+    /// `namespace` is the tenant whose statements are being judged.
+    ///
+    /// It is explicit rather than derived because [`Statement`] carries no
+    /// namespace of its own, and under BYOK the judgement is billed to that
+    /// tenant's provider key — the same key that paid for the extraction which
+    /// produced these statements. Defaulting it would silently bill the wrong
+    /// party, so the caller is required to supply it.
     fn judge_supersedes<'a>(
         &'a self,
+        namespace: &'a str,
         new_stmt: &'a Statement,
         existing_stmt: &'a Statement,
         rtxn: &'a ReadTransaction,

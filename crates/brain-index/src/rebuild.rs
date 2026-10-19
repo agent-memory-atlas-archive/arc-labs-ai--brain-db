@@ -114,6 +114,7 @@ mod tests {
             ef_construction: 100,
             ef_search: 50,
             ef_search_max: 250,
+            ef_factor: 1,
         };
         let (idx, _) =
             rebuild_impl(params, std::iter::empty::<(MemoryId, [f32; VECTOR_DIM])>()).unwrap();

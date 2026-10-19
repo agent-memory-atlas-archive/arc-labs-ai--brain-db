@@ -186,6 +186,8 @@ pub async fn start_full_pipeline_in(
             extractor_max_tokens: None,
             api_key: api_key.clone(),
             model: None,
+            // Static mode: these harnesses exercise the single-key path.
+            broker: None,
         };
         cfg.rerank = RerankSpawnConfig { enabled: false };
         cfg

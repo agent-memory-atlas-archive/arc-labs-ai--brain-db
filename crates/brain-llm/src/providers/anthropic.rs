@@ -131,7 +131,7 @@ impl LlmClient for AnthropicClient {
         Box::pin(async move {
             if self.api_key.is_empty() {
                 return Err(LlmError::Auth {
-                    provider: "anthropic",
+                    provider: crate::router::PROVIDER_ANTHROPIC,
                 });
             }
 
@@ -155,7 +155,7 @@ impl LlmClient for AnthropicClient {
             let status = resp.status();
             if status == 401 || status == 403 {
                 return Err(LlmError::Auth {
-                    provider: "anthropic",
+                    provider: crate::router::PROVIDER_ANTHROPIC,
                 });
             }
             if status == 429 {

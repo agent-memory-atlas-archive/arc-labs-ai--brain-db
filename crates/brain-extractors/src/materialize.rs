@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_core::ExtractorKind;
-use brain_llm::ModelRouter;
+use brain_llm::LlmCredentialResolver;
 use brain_metadata::tables::extractor::ExtractorDefinition;
 use brain_metadata::LlmCacheDb;
 use brain_protocol::schema::ast::{
@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::classifier::{ClassifierExtractor, ClassifierModel};
-use crate::framework::extractor::ExtractorError;
+use crate::framework::extractor::{ExtractorError, SYSTEM_NAMESPACE};
 use crate::framework::registry::ExtractorRegistry;
 use crate::llm::{CostBudget, LlmExtractor};
 use crate::pattern::extractor::PatternExtractor;
@@ -46,7 +46,13 @@ const DEFAULT_LLM_CONFIDENCE_THRESHOLD: f32 = 0.7;
 pub struct MaterializeDeps {
     pub classifier_model: Option<Arc<dyn ClassifierModel>>,
     pub entity_type_qnames: Arc<Vec<String>>,
-    pub model_router: Option<Arc<ModelRouter>>,
+    /// Resolves the LLM credential for a namespace.
+    ///
+    /// Replaces the pre-BYOK `model_router`: the credential is no longer a
+    /// single process-wide client chosen at shard startup, because under BYOK
+    /// it depends on whose memory is being extracted. A single-key deployment
+    /// passes a `StaticResolver` wrapping the same `ModelRouter` as before.
+    pub credential_resolver: Option<Arc<dyn LlmCredentialResolver>>,
     pub llm_cache: Option<Arc<Mutex<LlmCacheDb>>>,
     /// Output-token ceiling for one LLM extraction call
     /// (`[extractors.llm] max_tokens`). `None` uses
@@ -206,31 +212,44 @@ fn materialize_llm_extractor_core(
         }
     };
 
-    // Router resolution.
-    let Some(router) = deps.model_router.as_ref() else {
+    // Credential resolution is deferred to dispatch — the serving credential
+    // depends on the namespace of the memory being extracted, which is not
+    // known here. What IS checked at startup is that a resolver exists at all,
+    // and (when the resolver can answer locally, i.e. a static single-key
+    // deployment) that it actually holds a credential. That preserves the
+    // pre-BYOK operator diagnostic: a keyless static server still reports
+    // "no llm clients configured" at startup rather than failing per write.
+    //
+    // A broker-backed resolver answers `None` here — it cannot know every
+    // namespace's state without I/O — so the extractor is wired and any
+    // missing credential surfaces per dispatch instead.
+    let Some(resolver) = deps.credential_resolver.as_ref() else {
         return Ok(LlmExtractor::degraded(
             id,
             name,
             target,
             version,
             threshold,
-            "no llm clients configured (set BRAIN__LLM__API_KEY or [llm] api_key)",
+            "no llm credential resolver configured",
         ));
     };
-    let Some(client) = router.resolve(model) else {
-        let provider = brain_llm::Provider::classify(model);
-        return Ok(LlmExtractor::degraded(
-            id,
-            name,
-            target,
-            version,
-            threshold,
+    if resolver.can_serve(SYSTEM_NAMESPACE, Some(model)) == Some(false) {
+        // Distinguish the two operator-facing cases, as the pre-BYOK
+        // materializer did: no credential at all, versus a credential that
+        // cannot serve the model this extractor declares.
+        let reason = if resolver.can_serve(SYSTEM_NAMESPACE, None) == Some(false) {
+            resolver.missing_reason(SYSTEM_NAMESPACE)
+        } else {
+            let provider = brain_llm::Provider::classify(model);
             format!(
                 "no client configured for model {model} (provider {})",
                 provider.name()
-            ),
+            )
+        };
+        return Ok(LlmExtractor::degraded(
+            id, name, target, version, threshold, reason,
         ));
-    };
+    }
 
     // Schema compile.
     let response_schema = extract_response_schema(&ast);
@@ -263,7 +282,8 @@ fn materialize_llm_extractor_core(
         name,
         target,
         version,
-        client,
+        resolver.clone(),
+        model.to_string(),
         cache,
         prompt.to_string(),
         examples,
@@ -685,7 +705,7 @@ mod tests {
             llm_max_tokens: None,
             classifier_model: Some(Arc::new(DummyModel)),
             entity_type_qnames: labels.clone(),
-            model_router: None,
+            credential_resolver: None,
             llm_cache: None,
         };
         let defs = vec![row(1, ExtractorKind::Classifier, classifier_def_blob())];
@@ -742,6 +762,7 @@ mod tests {
         };
         let reg = ExtractorRegistry::new();
         let ctx = ExtractionContext {
+            memory_namespaces: None,
             declared_entity_types: None,
             candidate_predicates: None,
             declared_kinds: None,
@@ -802,7 +823,7 @@ mod tests {
     // ----- 21.4 LLM materialization -----------------------------------------
 
     use brain_llm::client::LlmFuture;
-    use brain_llm::{LlmClient, LlmError, LlmRequest, ModelRouter};
+    use brain_llm::{LlmClient, LlmError, LlmRequest};
     use brain_protocol::schema::ast::{
         CacheConfig as AstCacheConfig, CostExpr, CostUnit, DurationAst, DurationUnit,
         StatementKindAst,
@@ -831,11 +852,26 @@ mod tests {
         }
     }
 
-    fn anthropic_router() -> Arc<ModelRouter> {
+    /// Router-backed resolver with only the Anthropic slot filled.
+    ///
+    /// Deliberately a `StaticResolver` rather than a `FixedResolver`: these
+    /// tests assert that an undeclarable model degrades the extractor, and a
+    /// FixedResolver serves every model, which would make them vacuous.
+    fn anthropic_resolver() -> Arc<dyn LlmCredentialResolver> {
         let client: Arc<dyn LlmClient> = Arc::new(FakeClient {
             model: "claude-haiku-4-5".into(),
         });
-        Arc::new(ModelRouter::new().with_anthropic(client))
+        let router = Arc::new(brain_llm::ModelRouter::new().with_anthropic(client));
+        Arc::new(brain_llm::StaticResolver::new(router, "claude-haiku-4-5"))
+    }
+
+    /// A resolver for a deployment where the operator configured no key at
+    /// all: a StaticResolver over an empty router.
+    fn keyless_resolver() -> Arc<dyn LlmCredentialResolver> {
+        Arc::new(brain_llm::StaticResolver::new(
+            Arc::new(brain_llm::ModelRouter::new()),
+            "claude-haiku-4-5",
+        ))
     }
 
     fn llm_ast(name: &str, fields: Vec<ExtractorField>) -> Vec<u8> {
@@ -871,7 +907,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: None,
-            model_router: Some(anthropic_router()),
+            credential_resolver: Some(anthropic_resolver()),
             llm_cache: None,
             ..MaterializeDeps::default()
         };
@@ -882,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_llm_without_router_is_degraded() {
+    fn materialize_llm_without_a_key_is_degraded_at_startup() {
         let blob = llm_ast(
             "p",
             vec![
@@ -891,7 +927,14 @@ mod tests {
             ],
         );
         let r = row(1, ExtractorKind::Llm, blob);
-        let l = materialize_llm_extractor(&r, &MaterializeDeps::default()).unwrap();
+        // A resolver IS wired — the shard always wires one — but the operator
+        // set no key. Startup must still say so, rather than deferring to a
+        // per-write failure, which is what the pre-BYOK materializer did.
+        let deps = MaterializeDeps {
+            credential_resolver: Some(keyless_resolver()),
+            ..MaterializeDeps::default()
+        };
+        let l = materialize_llm_extractor(&r, &deps).unwrap();
         assert!(!l.is_wired());
         let reg = ExtractorRegistry::new();
         let mem = brain_core::Memory {
@@ -906,6 +949,7 @@ mod tests {
             occurred_at_unix_nanos: None,
         };
         let ctx = crate::framework::extractor::ExtractionContext {
+            memory_namespaces: None,
             declared_entity_types: None,
             candidate_predicates: None,
             declared_kinds: None,
@@ -921,6 +965,22 @@ mod tests {
     }
 
     #[test]
+    fn materialize_llm_without_a_resolver_is_degraded() {
+        // Distinct from "no key": no resolver at all is a wiring bug, not an
+        // operator misconfiguration, so it gets its own message.
+        let blob = llm_ast(
+            "p",
+            vec![
+                ExtractorField::Model("claude-haiku-4-5".into()),
+                ExtractorField::Prompt("x".into()),
+            ],
+        );
+        let r = row(1, ExtractorKind::Llm, blob);
+        let l = materialize_llm_extractor(&r, &MaterializeDeps::default()).unwrap();
+        assert!(!l.is_wired());
+    }
+
+    #[test]
     fn materialize_llm_unknown_model_is_degraded() {
         let blob = llm_ast(
             "p",
@@ -933,7 +993,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: None,
-            model_router: Some(anthropic_router()),
+            credential_resolver: Some(anthropic_resolver()),
             llm_cache: None,
             ..MaterializeDeps::default()
         };
@@ -955,7 +1015,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: None,
-            model_router: Some(anthropic_router()),
+            credential_resolver: Some(anthropic_resolver()),
             llm_cache: None,
             ..MaterializeDeps::default()
         };
@@ -970,7 +1030,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: None,
-            model_router: Some(anthropic_router()),
+            credential_resolver: Some(anthropic_resolver()),
             llm_cache: None,
             ..MaterializeDeps::default()
         };
@@ -985,7 +1045,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: None,
-            model_router: Some(anthropic_router()),
+            credential_resolver: Some(anthropic_resolver()),
             llm_cache: None,
             ..MaterializeDeps::default()
         };
@@ -1008,7 +1068,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: None,
-            model_router: Some(anthropic_router()),
+            credential_resolver: Some(anthropic_resolver()),
             llm_cache: None,
             ..MaterializeDeps::default()
         };
@@ -1033,7 +1093,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: None,
-            model_router: Some(anthropic_router()),
+            credential_resolver: Some(anthropic_resolver()),
             llm_cache: None,
             ..MaterializeDeps::default()
         };
@@ -1088,7 +1148,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: None,
-            model_router: Some(anthropic_router()),
+            credential_resolver: Some(anthropic_resolver()),
             llm_cache: None,
             ..MaterializeDeps::default()
         };
