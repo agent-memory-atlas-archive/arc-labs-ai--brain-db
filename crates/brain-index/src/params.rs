@@ -57,7 +57,7 @@ pub struct IndexParams {
     ///
     /// # Most of the accepted range does nothing at the shipped defaults
     ///
-    /// The derived beam is clamped to [`EF_SEARCH_MAX`][crate::EF_SEARCH_MAX]
+    /// The derived beam is clamped to [`EF_SEARCH_MAX`][crate::semantic_retriever::EF_SEARCH_MAX]
     /// (500), so the factor stops having any effect once `k * ef_factor`
     /// crosses it. At the shipped `DEFAULT_TOP_K` of 64 that happens at **8**:
     ///
