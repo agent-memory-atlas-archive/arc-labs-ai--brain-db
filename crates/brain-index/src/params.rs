@@ -54,6 +54,29 @@ pub struct IndexParams {
     /// in proportion to `k`, so the recall it buys has to be measured before
     /// the default moves. That measurement needs the retrieval-only eval
     /// (§6 of the accuracy plan) which does not exist yet.
+    ///
+    /// # Most of the accepted range does nothing at the shipped defaults
+    ///
+    /// The derived beam is clamped to [`EF_SEARCH_MAX`][crate::EF_SEARCH_MAX]
+    /// (500), so the factor stops having any effect once `k * ef_factor`
+    /// crosses it. At the shipped `DEFAULT_TOP_K` of 64 that happens at **8**:
+    ///
+    /// ```text
+    ///   k=64, ef_factor=7  ->  448   distinct
+    ///   k=64, ef_factor=8  ->  512 -> clamped to 500
+    ///   k=64, ef_factor=16 ->       clamped to 500   (identical to 8)
+    /// ```
+    ///
+    /// [`validate`][Self::validate] accepts `1..=16` because the useful range
+    /// depends on `k`, which is a per-query value it cannot see — at `k=10`
+    /// every factor up to 16 is still distinct. But at the default `k` that
+    /// means **nine of the sixteen accepted values are the same setting**, and
+    /// raising the factor from 8 to 16 reads as a tuning change while
+    /// changing nothing.
+    ///
+    /// Written down rather than narrowed: a smaller validated range would be
+    /// wrong for small-`k` callers, and silently flattening half the range is
+    /// the part worth knowing.
     pub ef_factor: usize,
 }
 

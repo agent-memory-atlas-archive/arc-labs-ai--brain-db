@@ -1268,6 +1268,37 @@ fn ef_factor_widens_the_beam_past_k() {
 }
 
 #[test]
+fn ef_factor_saturates_at_eight_for_the_default_k() {
+    // The knob's accepted range is 1..=16, but the beam is clamped to
+    // EF_SEARCH_MAX (500), so at the shipped DEFAULT_TOP_K of 64 everything
+    // from 8 upward is the same setting: 64 * 8 = 512, already over the cap.
+    //
+    // Nine of sixteen accepted values therefore do nothing at the default k,
+    // and moving the factor from 8 to 16 reads as tuning while changing
+    // nothing. Pinned so the threshold cannot drift without a test saying so —
+    // if the cap or DEFAULT_TOP_K moves, this is where it surfaces.
+    const K: usize = 64;
+
+    let seven = super::resolve_probe_ef(64, K, 0, 7);
+    assert_eq!(
+        seven, 448,
+        "k * 7 is still under the cap and must be distinct"
+    );
+    assert!(seven < SEMANTIC_EF_SEARCH_MAX);
+
+    let eight = super::resolve_probe_ef(64, K, 0, 8);
+    let sixteen = super::resolve_probe_ef(64, K, 0, 16);
+    assert_eq!(
+        eight, SEMANTIC_EF_SEARCH_MAX,
+        "k * 8 = 512 crosses the cap, so 8 is already saturated"
+    );
+    assert_eq!(
+        eight, sixteen,
+        "every factor at or above 8 is the same setting at the default k"
+    );
+}
+
+#[test]
 fn ef_factor_cannot_exceed_the_hard_cap() {
     // A large k times a large factor must still land under the ceiling, or a
     // single query could ask the index to explore without bound.
