@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "brain-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "brain-embed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "brain-extractors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "brain-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "brain-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "brain-llm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "http-body-util",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "brain-metadata"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "brain-ops"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "brain-planner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "brain-plugins"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "brain-core",
  "brain-extractors",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "brain-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "brain-core",
  "bytemuck",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "brain-rerank"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "brain-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "brain-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "brain-core",
  "bytemuck",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "brain-workers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "brain-core",
@@ -4004,9 +4004,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -5452,9 +5452,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.7"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]
