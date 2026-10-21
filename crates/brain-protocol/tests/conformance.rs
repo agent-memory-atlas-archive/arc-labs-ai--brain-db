@@ -50,8 +50,8 @@ use brain_protocol::ops::query::{
 };
 use brain_protocol::{
     ActAs, AnswerKindWire, ByeRequest, CancelStreamAck, CancelStreamRequest, CancellationReason,
-    ClientPongRequest, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode, EncodeRequest,
-    EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
+    ClientPongRequest, EdgeDirectionWire, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode,
+    EncodeRequest, EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
     EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity,
     EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus,
     EncodeTraceStatement, EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse,
@@ -63,8 +63,8 @@ use brain_protocol::{
     ExtractorListRequest, ExtractorListResponseFrame, ForgetMode, ForgetRequest, ForgetResponse,
     Frame, GraphEdge, GraphFetchRequest, GraphFetchResponseFrame, GraphNode, InferenceKind,
     InferenceStep, LinkRequest, LinkResponse, MaterializeProceduralRequest,
-    MaterializeProceduralResponse, MemoryInspectRequest, MemoryInspectResponse, MemoryKindWire,
-    MemoryListDirWire, MemoryListItem, MemoryListRequest, MemoryListResponseFrame,
+    MaterializeProceduralResponse, MemoryEdgeWire, MemoryInspectRequest, MemoryInspectResponse,
+    MemoryKindWire, MemoryListDirWire, MemoryListItem, MemoryListRequest, MemoryListResponseFrame,
     MemoryListSortWire, MemoryListTimeAxisWire, ObservationInput, Opcode, PingRequest, PlanBudget,
     PlanRequest, PlanResponseFrame, PlanState, PlanStatus, PlanStep, PlanTrace, PlanTraceDirection,
     PlanTraceMeetingPoint, PlanTraceNode, PongResponse, RankedItemKindWire, ReasonRequest,
@@ -891,6 +891,28 @@ fn sample_memory_inspect_response() -> MemoryInspectResponse {
                 }],
             }),
         },
+        // Two edges, one per direction, so the golden pins both discriminants
+        // and the omitted-annotation encoding. `artifact.graph` above is the
+        // extractor's write-time view; these are the LINK-asserted edges, and
+        // the fixture carries both to keep them visibly distinct.
+        edges: vec![
+            MemoryEdgeWire {
+                kind: EdgeKindWire::Caused,
+                direction: EdgeDirectionWire::Outgoing,
+                peer: mid(),
+                weight: 1.0,
+                created_at_unix_nanos: 1_700_000_000_000_000_000,
+                annotation: None,
+            },
+            MemoryEdgeWire {
+                kind: EdgeKindWire::Supports,
+                direction: EdgeDirectionWire::Incoming,
+                peer: mid(),
+                weight: 0.5,
+                created_at_unix_nanos: 1_700_000_000_000_000_001,
+                annotation: Some("manually asserted".into()),
+            },
+        ],
     }
 }
 
