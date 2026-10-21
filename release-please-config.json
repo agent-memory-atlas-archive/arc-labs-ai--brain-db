@@ -5,21 +5,59 @@
   "bump-minor-pre-major": true,
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "changelog-path": "CHANGELOG.md",
-      "_comment_release_type": "`rust`, not `simple`. `simple` has no updater that can reach Cargo.lock, so every release left the lock naming the PREVIOUS version while Cargo.toml named the new one: `cargo --locked` failed on main and nothing in CI enforced it, so it went unnoticed. The same config in brain-sdk surfaced as a failed crates.io publish, where `cargo publish` re-resolved the lock, found the tree dirty and refused. `rust` updates the workspace manifest and Cargo.lock together, which is what brain-edge already does. No `extra-files` entry for Cargo.toml: the rust strategy owns it."
+      "extra-files": [
+        "Cargo.toml"
+      ],
+      "_comment_release_type": "`simple`, NOT `rust`. The rust strategy reads `package.version`, and this repo's root is a VIRTUAL workspace -- [workspace] + [workspace.package], with no [package] -- so it fails outright with 'value at path package.version is not tagged' and cuts no release PR at all. brain-edge uses `rust` because it is a single crate with a real [package]; that is the difference, not a preference. Known consequence: `simple` has no updater that can reach Cargo.lock, so each release leaves the lock naming the PREVIOUS version and `cargo --locked` fails on main until someone regenerates it. Make that loud with a --locked check in CI rather than trying to make the release strategy fix it."
     }
   },
   "changelog-sections": [
-    { "type": "feat", "section": "Features" },
-    { "type": "fix", "section": "Bug Fixes" },
-    { "type": "perf", "section": "Performance" },
-    { "type": "refactor", "section": "Refactoring" },
-    { "type": "revert", "section": "Reverts" },
-    { "type": "docs", "section": "Documentation", "hidden": true },
-    { "type": "test", "section": "Tests", "hidden": true },
-    { "type": "build", "section": "Build", "hidden": true },
-    { "type": "ci", "section": "CI", "hidden": true },
-    { "type": "chore", "section": "Chores", "hidden": true }
+    {
+      "type": "feat",
+      "section": "Features"
+    },
+    {
+      "type": "fix",
+      "section": "Bug Fixes"
+    },
+    {
+      "type": "perf",
+      "section": "Performance"
+    },
+    {
+      "type": "refactor",
+      "section": "Refactoring"
+    },
+    {
+      "type": "revert",
+      "section": "Reverts"
+    },
+    {
+      "type": "docs",
+      "section": "Documentation",
+      "hidden": true
+    },
+    {
+      "type": "test",
+      "section": "Tests",
+      "hidden": true
+    },
+    {
+      "type": "build",
+      "section": "Build",
+      "hidden": true
+    },
+    {
+      "type": "ci",
+      "section": "CI",
+      "hidden": true
+    },
+    {
+      "type": "chore",
+      "section": "Chores",
+      "hidden": true
+    }
   ]
 }
