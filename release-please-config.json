@@ -5,9 +5,9 @@
   "bump-minor-pre-major": true,
   "packages": {
     ".": {
-      "release-type": "simple",
+      "release-type": "rust",
       "changelog-path": "CHANGELOG.md",
-      "extra-files": ["Cargo.toml"]
+      "_comment_release_type": "`rust`, not `simple`. `simple` has no updater that can reach Cargo.lock, so every release left the lock naming the PREVIOUS version while Cargo.toml named the new one: `cargo --locked` failed on main and nothing in CI enforced it, so it went unnoticed. The same config in brain-sdk surfaced as a failed crates.io publish, where `cargo publish` re-resolved the lock, found the tree dirty and refused. `rust` updates the workspace manifest and Cargo.lock together, which is what brain-edge already does. No `extra-files` entry for Cargo.toml: the rust strategy owns it."
     }
   },
   "changelog-sections": [

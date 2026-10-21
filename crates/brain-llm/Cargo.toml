@@ -17,7 +17,9 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+# `rt-multi-thread` + `net`: the broker resolver owns a small runtime so its
+# hyper-based HTTP has a reactor, because its caller runs on glommio (#34).
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "net"] }
 tracing.workspace = true
 
 [dev-dependencies]

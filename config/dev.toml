@@ -257,6 +257,35 @@ openai_model = "gpt-4o-mini"
 #   BRAIN__LLM__API_KEY=sk-...   BRAIN__LLM__MODEL=gpt-4o-mini
 api_key = ""   # operator sets at deploy time — never commit a real key
 # model = "gpt-4o-mini"  # default when unset
+#
+# ── Credential mode ─────────────────────────────────────────────────────────
+# mode = "static"   # the default, and what the key above is for
+#
+# "static"  One credential, every namespace. `api_key` is mandatory: HyPE is
+#           always-on, so a keyless server cannot run.
+#
+# "broker"  BYOK. Per-namespace credentials resolved from an Arc Labs LLM
+#           broker. Brain holds a namespace-scoped GRANT, never the tenant's
+#           provider key, so customer keys stay out of this process's WAL,
+#           snapshots and backups. `api_key` is ignored. A keyless boot is
+#           legal here and ONLY here, because the credential is not known
+#           until a write names its namespace.
+#
+#           A namespace with no registered key fails its writes with
+#           `llm_credential.missing` instead of silently billing a house key —
+#           which is the point, and also the thing to know before flipping it
+#           on an existing deployment.
+#
+# [llm.broker]                        # required when mode = "broker"
+# url = "http://brain-edge:8080"      # the broker's base URL
+# service_key = ""                    # Brain's identity to the broker. NOT a
+#                                     # provider key: it authenticates Brain so
+#                                     # the broker will swap a grant for the
+#                                     # tenant's real key on the way upstream.
+#                                     # Override: BRAIN__LLM__BROKER__SERVICE_KEY
+# ttl_secs = 300                      # how long a resolved credential is
+#                                     # cached; bounds how long a revoked key
+#                                     # keeps working.
 
 [rerank]
 # Off by default: rerank only reorders already-retrieved candidates and

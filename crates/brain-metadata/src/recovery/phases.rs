@@ -23,7 +23,7 @@ use crate::db::MetadataDb;
 use crate::entity::merge::{merge_entity, unmerge_entity, MergeActor};
 use crate::entity::ops::{
     entity_get_inside_wtxn, entity_put, entity_rename, entity_tombstone, entity_update,
-    normalize_name,
+    normalize_name, EntityOpError,
 };
 use crate::extractor::ops::extractor_drop_namespace;
 use crate::recovery::phase_bodies::{
@@ -77,8 +77,42 @@ impl MetadataDb {
                 // The WAL body row carries the first-mention session; replay
                 // it so the recovered entity keeps its session provenance
                 // (Entity::from drops it — brain-core has no session slot).
-                entity_put(&wtxn, scope, meta.session(), &entity)
-                    .map_err(|e| MetadataSinkError::Corruption(format!("entity_put: {e}")))?;
+                match entity_put(&wtxn, scope, meta.session(), &entity) {
+                    Ok(()) => {}
+                    // A DIFFERENT id already holds this canonical name.
+                    //
+                    // The guard above only catches a replay of the same row.
+                    // This is the other shape: the WAL logs an attempt before
+                    // the apply decides whether it is legal, so a create the
+                    // API already REFUSED is in the log too — with a fresh id
+                    // minted for the attempt and a name that was taken. Its
+                    // caller got a 409 at the time; the row never existed.
+                    //
+                    // Replaying it must reproduce that outcome, which means
+                    // not writing it. Treating it as corruption instead made
+                    // the shard unbootable for good: the record replays on
+                    // every subsequent boot, there is no repair path, and the
+                    // trigger is a request the API handled CORRECTLY. One
+                    // refused duplicate — which the project's own conformance
+                    // suite issues on purpose — cost a whole dataset.
+                    //
+                    // Skipping is safe precisely because the name is taken:
+                    // the invariant `entity_put` protects is already held by
+                    // the row that legitimately owns it.
+                    Err(EntityOpError::DuplicateCanonicalName { name, existing, .. }) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            skipped_id = ?entity.id,
+                            existing_id = ?existing,
+                            canonical_name = %name,
+                            "replayed entity create refused at write time; skipping",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(MetadataSinkError::Corruption(format!("entity_put: {e}")));
+                    }
+                }
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -650,6 +684,53 @@ mod tests {
         assert_eq!(got.canonical_name, "Priya Patel");
         assert_eq!(got.aliases.len(), 2);
         assert_eq!(got.entity_type, EntityType::PERSON_ID);
+    }
+
+    /// A create the API already REFUSED must not brick the shard on replay.
+    ///
+    /// The WAL logs an attempt before the apply decides whether it is legal,
+    /// so a duplicate `CREATE` that the caller got a 409 for is in the log
+    /// too — with a freshly minted id and a canonical name that was already
+    /// taken. `entity_create_double_replay_is_idempotent` above covers the
+    /// SAME id replayed twice, which the id guard catches. This is the other
+    /// shape, and it used to abort recovery as `Corruption`:
+    ///
+    ///     metadata sink rejected record at LSN 48: corruption: entity_put:
+    ///     duplicate canonical_name "crashprobe" ...
+    ///
+    /// Which made the shard unbootable permanently — the record replays every
+    /// boot, with no repair path, from a request the API handled correctly.
+    #[test]
+    fn a_create_refused_at_write_time_is_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        // The create that succeeded and owns the name.
+        let winner = person_entity("Priya Patel");
+        let winner_id = winner.id;
+        let winner_body = encode_entity_create(&EntityMetadata::from_entity(&winner, test_scope()));
+        db.apply_entity_create(10, &winner_body).unwrap();
+
+        // The duplicate attempt: SAME canonical name, DIFFERENT id, exactly
+        // as the write path mints it before the apply refuses.
+        let refused = person_entity("Priya Patel");
+        let refused_id = refused.id;
+        assert_ne!(refused_id, winner_id, "the attempt carries its own id");
+        let refused_body =
+            encode_entity_create(&EntityMetadata::from_entity(&refused, test_scope()));
+
+        db.apply_entity_create(11, &refused_body)
+            .expect("a refused create must be skipped on replay, not abort the shard");
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            entity_get(&rtxn, refused_id).unwrap().is_none(),
+            "the refused attempt must NOT be materialised — its caller got a 409"
+        );
+        let kept = entity_get(&rtxn, winner_id)
+            .unwrap()
+            .expect("the legitimate owner survives");
+        assert_eq!(kept.canonical_name, "Priya Patel");
     }
 
     #[test]

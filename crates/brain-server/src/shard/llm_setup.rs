@@ -411,17 +411,39 @@ fn open_cache(shard_dir: &Path) -> Option<Arc<Mutex<LlmCacheDb>>> {
             // open at server startup is another brain-server process
             // already holding it. Spell that out so operators know what
             // to do — the warn alone left users grep-ing.
-            let hint = if e.to_string().contains("Database already open")
-                || e.to_string().contains("Cannot acquire lock")
-            {
-                Some(format!(
-                    "another process holds the redb lock — check `fuser {p}` or \
+            let text = e.to_string();
+            let hint =
+                if text.contains("Database already open") || text.contains("Cannot acquire lock") {
+                    Some(format!(
+                        "another process holds the redb lock — check `fuser {p}` or \
                      `pgrep -fl brain-server`",
-                    p = path.display()
-                ))
-            } else {
-                None
-            };
+                        p = path.display()
+                    ))
+                } else if text.contains("type mismatch") || text.contains("TableTypeMismatch") {
+                    // A cache written before BYOK. The key gained a credential
+                    // scope, so redb's signature check refuses the old table —
+                    // deliberately, rather than serving one tenant's paid
+                    // completion to another.
+                    //
+                    // Worth naming, because this one is fatal and looks like a
+                    // crash: the shard spawn path treats a `None` cache as
+                    // unrecoverable (HyPE is mandatory and needs it), so the whole
+                    // server fails to start. Without this line an operator sees
+                    // "failed to spawn shard" and a redb type error, and nothing
+                    // connecting either to an upgrade they just performed.
+                    //
+                    // The file is a cache. Deleting it costs re-paying for
+                    // completions, not data.
+                    Some(format!(
+                        "this cache predates BYOK and cannot be upgraded in place — \
+                     the cache key gained a credential scope. Delete it and \
+                     restart: `rm {p}`. It is a cache; the only cost is \
+                     re-requesting completions that were cached.",
+                        p = path.display()
+                    ))
+                } else {
+                    None
+                };
             tracing::warn!(
                 target: "brain_server::shard::llm_setup",
                 path = %path.display(),
