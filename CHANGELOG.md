@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.1](https://github.com/arc-labs-ai/brain-db/compare/v0.2.0...v0.2.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* broker resolver, release config, and four tuning gaps ([8664784](https://github.com/arc-labs-ai/brain-db/commit/8664784954207787eae759b64ed4c42c54d5c586))
+* close four of the six open tuning and release gaps ([1271c7e](https://github.com/arc-labs-ai/brain-db/commit/1271c7ef02a0a4c6638ac145d7c7f68c009581e3))
+* **llm:** run the broker resolver's HTTP off the shard executor ([083039e](https://github.com/arc-labs-ai/brain-db/commit/083039e83e06173e3012dee0d96027a6cfdab201))
+* **recovery:** skip a create the API already refused instead of aborting ([ff13c50](https://github.com/arc-labs-ai/brain-db/commit/ff13c500e41e023075d1387855810dfc4894a311))
+* **release:** revert release-type to simple; rust cannot read a virtual workspace ([9666b37](https://github.com/arc-labs-ai/brain-db/commit/9666b37a11dff729769707dcd52cebdefdf36737))
+
 ## [0.2.0](https://github.com/arc-labs-ai/brain-db/compare/v0.1.0...v0.2.0) (2026-10-19)
 
 
